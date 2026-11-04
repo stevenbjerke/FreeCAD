@@ -36,4 +36,10 @@ MainThreadSignalConfig::InvokeFn& MainThreadSignalConfig::invokeSlot()
     return fn;
 }
 
+MainThreadSignalConfig::DeferredQueue*& MainThreadSignalConfig::deferredQueueSlot()
+{
+    thread_local DeferredQueue* queue = nullptr;
+    return queue;
+}
+
 }  // namespace App

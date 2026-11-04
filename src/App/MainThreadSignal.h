@@ -32,6 +32,7 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace App
 {
@@ -77,9 +78,31 @@ public:
         }
     }
 
+    /// Notifications queued instead of delivered, see setDeferredQueue().
+    using DeferredQueue = std::vector<std::function<void()>>;
+
+    /** Queue main-thread signals emitted on the calling thread instead of delivering them.
+     *
+     * Used by parallel recompute: a worker thread computing one object must not run
+     * observers itself (they are not written to run concurrently) nor block on a hop to
+     * the main thread. While a queue is set, void signals emitted on this thread are
+     * appended to it, and the owner of the queue replays them later, in order, by
+     * calling each entry. Pass nullptr to restore normal delivery.
+     */
+    static void setDeferredQueue(DeferredQueue* queue)
+    {
+        deferredQueueSlot() = queue;
+    }
+
+    static DeferredQueue* deferredQueue()
+    {
+        return deferredQueueSlot();
+    }
+
 private:
     static IsMainThreadFn& isMainThreadSlot();
     static InvokeFn& invokeSlot();
+    static DeferredQueue*& deferredQueueSlot();
 };
 
 namespace detail
@@ -223,6 +246,18 @@ private:
         typename ::fastsignals::signal_arg_t<Arguments>... args
     )
     {
+        if constexpr (std::is_void_v<result_type>) {
+            if (auto* queue = MainThreadSignalConfig::deferredQueue()) {
+                auto caps = std::make_tuple(
+                    detail::captureSignalArg<typename ::fastsignals::signal_arg_t<Arguments>>(args)...
+                );
+                queue->emplace_back([self, caps = std::move(caps)]() mutable {
+                    std::apply([self](auto&... c) { self->emit(c.get()...); }, caps);
+                });
+                return;
+            }
+        }
+
         if (MainThreadSignalConfig::isMainThread()) {
             return self->sig_(std::forward<typename ::fastsignals::signal_arg_t<Arguments>>(args)...);
         }

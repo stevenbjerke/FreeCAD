@@ -29,10 +29,11 @@
 #include <FCBRepAlgoAPI_Section.h>
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
-#include <BRepCheck_Analyzer.hxx>
 #include <TopoDS_Shape.hxx>
 #include <Precision.hxx>
 #include <FuzzyHelper.h>
+
+#include "Tools.h"
 
 FCBRepAlgoAPI_Section::FCBRepAlgoAPI_Section()
 {
@@ -47,10 +48,10 @@ FCBRepAlgoAPI_Section::FCBRepAlgoAPI_Section(
 )
     : BRepAlgoAPI_Section(S1, S2, false)
 {
-    if (!BRepCheck_Analyzer(S1).IsValid()) {
+    if (!Part::Tools::isShapeValid(S1)) {
         throw Standard_ConstructionError("Base shape is not valid for boolean operation");
     }
-    if (!BRepCheck_Analyzer(S2).IsValid()) {
+    if (!Part::Tools::isShapeValid(S2)) {
         throw Standard_ConstructionError("Tool shape is not valid for boolean operation");
     }
     setAutoFuzzy();
@@ -68,7 +69,7 @@ FCBRepAlgoAPI_Section::FCBRepAlgoAPI_Section(
 )
     : BRepAlgoAPI_Section(Sh, Pl, false)
 {
-    if (!BRepCheck_Analyzer(Sh).IsValid()) {
+    if (!Part::Tools::isShapeValid(Sh)) {
         throw Standard_ConstructionError("Base shape is not valid for boolean operation");
     }
     setAutoFuzzy();

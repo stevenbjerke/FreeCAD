@@ -29,6 +29,7 @@
 #include <BRepBndLib.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepCheck_Analyzer.hxx>
 #include <BRepIntCurveSurface_Inter.hxx>
 #include <BRepLProp_SLProps.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
@@ -904,4 +905,24 @@ Standard_Real Part::Tools::getDeflection(const Bnd_Box& bounds, double deviation
 Standard_Real Part::Tools::getDeflection(const TopoDS_Shape& shape, double deviation)
 {
     return getDeflection(getBounds(shape), deviation);
+}
+
+bool Part::Tools::isShapeValid(const TopoDS_Shape& shape)
+{
+#if OCC_VERSION_HEX >= 0x070600
+    // Below this many faces the cost of dispatching to the thread pool is
+    // larger than the checking work itself, so stay serial.
+    constexpr int parallelFaceThreshold = 16;
+
+    int faces = 0;
+    for (TopExp_Explorer xp(shape, TopAbs_FACE); xp.More() && faces < parallelFaceThreshold;
+         xp.Next()) {
+        ++faces;
+    }
+    const bool inParallel = faces >= parallelFaceThreshold;
+    BRepCheck_Analyzer checker(shape, /*GeomControls=*/Standard_True, inParallel);
+#else
+    BRepCheck_Analyzer checker(shape);
+#endif
+    return checker.IsValid();
 }

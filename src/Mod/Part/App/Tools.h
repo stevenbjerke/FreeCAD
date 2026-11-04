@@ -389,6 +389,19 @@ public:
      * \return The computed deflection value.
      */
     static Standard_Real getDeflection(const TopoDS_Shape& shape, double deviation);
+
+    /**
+     * \brief Checks a shape for topological and geometric validity.
+     *
+     * Equivalent to `BRepCheck_Analyzer(shape).IsValid()`, but runs the
+     * per-sub-shape checks in parallel when the shape has enough faces for
+     * that to pay off. The checks performed, and therefore the result, are
+     * the same in both modes.
+     *
+     * \param[in] shape The shape to check.
+     * \return `true` if the shape passes all checks, otherwise `false`.
+     */
+    static bool isShapeValid(const TopoDS_Shape& shape);
 };
 
 }  // namespace Part

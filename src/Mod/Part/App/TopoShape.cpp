@@ -1437,8 +1437,7 @@ bool TopoShape::isNull() const
 
 bool TopoShape::isValid() const
 {
-    BRepCheck_Analyzer aChecker(this->_Shape);
-    return aChecker.IsValid() ? true : false;
+    return Tools::isShapeValid(this->_Shape);
 }
 
 bool TopoShape::isEmpty() const

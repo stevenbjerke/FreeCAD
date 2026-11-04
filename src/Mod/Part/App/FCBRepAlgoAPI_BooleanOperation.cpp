@@ -29,7 +29,6 @@
 #include <FCBRepAlgoAPI_BooleanOperation.h>
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
-#include <BRepCheck_Analyzer.hxx>
 #include <BRep_Builder.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Iterator.hxx>
@@ -37,6 +36,8 @@
 #include <FuzzyHelper.h>
 #include <SignalException.h>
 #include <Base/Console.h>
+
+#include "Tools.h"
 
 FCBRepAlgoAPI_BooleanOperation::FCBRepAlgoAPI_BooleanOperation()
 {
@@ -52,11 +53,11 @@ FCBRepAlgoAPI_BooleanOperation::FCBRepAlgoAPI_BooleanOperation(
 )
     : BRepAlgoAPI_BooleanOperation(theS1, theS2, theOperation)
 {
-    if (!BRepCheck_Analyzer(theS1).IsValid()) {
+    if (!Part::Tools::isShapeValid(theS1)) {
         Base::Console().warning("Base shape is not valid for boolean operation");
     }
 
-    if (!BRepCheck_Analyzer(theS2).IsValid()) {
+    if (!Part::Tools::isShapeValid(theS2)) {
         Base::Console().warning("Tool shape is not valid for boolean operation");
     }
 

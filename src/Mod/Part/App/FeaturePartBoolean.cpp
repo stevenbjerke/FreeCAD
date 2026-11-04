@@ -27,7 +27,6 @@
 #include <memory>
 
 #include <Mod/Part/App/FCBRepAlgoAPI_BooleanOperation.h>
-#include <BRepCheck_Analyzer.hxx>
 #include <Standard_Failure.hxx>
 
 #include <App/Application.h>
@@ -38,6 +37,7 @@
 #include "FeaturePartBoolean.h"
 #include "TopoShapeOpCode.h"
 #include "modelRefine.h"
+#include "Tools.h"
 
 
 using namespace Part;
@@ -53,8 +53,7 @@ void throwIfInvalidIfCheckModel(const TopoDS_Shape& shape)
                                              ->GetGroup("Mod/Part/Boolean");
 
     if (hGrp->GetBool("CheckModel", true)) {
-        BRepCheck_Analyzer aChecker(shape);
-        if (!aChecker.IsValid()) {
+        if (!Tools::isShapeValid(shape)) {
             throw Base::RuntimeError("Resulting shape is invalid");
         }
     }

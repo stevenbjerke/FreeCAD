@@ -24,6 +24,7 @@
 #include <QCryptographicHash>
 #include <QHash>
 #include <deque>
+#include <mutex>
 
 #include <Base/Console.h>
 #include <Base/Reader.h>
@@ -82,7 +83,27 @@ class StringHasher::HashMap: public HashMapBase
 public:
     bool SaveAll = false;
     int Threshold = 0;
+    // Recursive because some operations call others (getID of a mapped name
+    // encodes its parts with getID, compact releases IDs that refer to others).
+    mutable std::recursive_mutex Mutex;
 };
+
+using HashLock = std::lock_guard<std::recursive_mutex>;
+
+namespace
+{
+thread_local StringHasherOrderGate* currentOrderGate = nullptr;
+}
+
+StringHasherOrderGate* StringHasherOrderGate::current()
+{
+    return currentOrderGate;
+}
+
+void StringHasherOrderGate::setCurrent(StringHasherOrderGate* gate)
+{
+    currentOrderGate = gate;
+}
 
 ///////////////////////////////////////////////////////////
 
@@ -91,6 +112,7 @@ TYPESYSTEM_SOURCE_ABSTRACT(App::StringID, Base::BaseClass)
 StringID::~StringID()
 {
     if (_hasher) {
+        HashLock lock(_hasher->_hashes->Mutex);
         _hasher->_hashes->right.erase(_id);
     }
 }
@@ -182,6 +204,7 @@ StringHasher::~StringHasher()
 
 void StringHasher::setSaveAll(bool enable)
 {
+    HashLock lock(_hashes->Mutex);
     if (_hashes->SaveAll == enable) {
         return;
     }
@@ -191,6 +214,7 @@ void StringHasher::setSaveAll(bool enable)
 
 void StringHasher::compact()
 {
+    HashLock lock(_hashes->Mutex);
     if (_hashes->SaveAll) {
         return;
     }
@@ -228,21 +252,25 @@ void StringHasher::compact()
 
 bool StringHasher::getSaveAll() const
 {
+    HashLock lock(_hashes->Mutex);
     return _hashes->SaveAll;
 }
 
 void StringHasher::setThreshold(int threshold)
 {
+    HashLock lock(_hashes->Mutex);
     _hashes->Threshold = threshold;
 }
 
 int StringHasher::getThreshold() const
 {
+    HashLock lock(_hashes->Mutex);
     return _hashes->Threshold;
 }
 
 long StringHasher::lastID() const
 {
+    HashLock lock(_hashes->Mutex);
     if (_hashes->right.empty()) {
         return 0;
     }
@@ -260,6 +288,23 @@ StringIDRef StringHasher::getID(const char* text, int len, bool hashable)
 }
 
 StringIDRef StringHasher::getID(const QByteArray& data, Options options)
+{
+    if (auto* gate = StringHasherOrderGate::current()) {
+        {
+            HashLock lock(_hashes->Mutex);
+            if (auto found = getIDLocked(data, options, /*lookupOnly=*/true)) {
+                return found;
+            }
+        }
+        // A new string is needed; insert it only once all objects ahead of
+        // this one in the recompute order are done, so numbering is stable.
+        gate->waitForTurn();
+    }
+    HashLock lock(_hashes->Mutex);
+    return getIDLocked(data, options, /*lookupOnly=*/false);
+}
+
+StringIDRef StringHasher::getIDLocked(const QByteArray& data, Options options, bool lookupOnly)
 {
     bool binary = options.testFlag(Option::Binary);
     bool hashable = options.testFlag(Option::Hashable);
@@ -281,6 +326,9 @@ StringIDRef StringHasher::getID(const QByteArray& data, Options options)
     if (it != _hashes->left.end()) {
         return {it->first};
     }
+    if (lookupOnly) {
+        return {};
+    }
 
     if (!hashed && !nocopy) {
         // if not hashed, make a deep copy of the data
@@ -299,6 +347,25 @@ StringIDRef StringHasher::getID(const QByteArray& data, Options options)
 }
 
 StringIDRef StringHasher::getID(const Data::MappedName& name, const QVector<StringIDRef>& sids)
+{
+    if (auto* gate = StringHasherOrderGate::current()) {
+        {
+            HashLock lock(_hashes->Mutex);
+            if (auto found = getIDLocked(name, sids, /*lookupOnly=*/true)) {
+                return found;
+            }
+        }
+        gate->waitForTurn();
+    }
+    HashLock lock(_hashes->Mutex);
+    return getIDLocked(name, sids, /*lookupOnly=*/false);
+}
+
+StringIDRef StringHasher::getIDLocked(
+    const Data::MappedName& name,
+    const QVector<StringIDRef>& sids,
+    bool lookupOnly
+)
 {
     StringID tempID;
     tempID._postfix = name.postfixBytes();
@@ -329,6 +396,9 @@ StringIDRef StringHasher::getID(const Data::MappedName& name, const QVector<Stri
         }
         return res;
     }
+    if (lookupOnly) {
+        return {};
+    }
 
     if (!indexed && name.isRaw()) {
         // Make a copy of the memory if we didn't do so earlier
@@ -338,14 +408,14 @@ StringIDRef StringHasher::getID(const Data::MappedName& name, const QVector<Stri
     // If the postfix is not already encoded, use getID to encode it:
     StringIDRef postfixRef;
     if ((tempID._postfix.size() != 0) && tempID._postfix.indexOf("#") < 0) {
-        postfixRef = getID(tempID._postfix);
+        postfixRef = getIDLocked(tempID._postfix, Option::Hashable, /*lookupOnly=*/false);
         postfixRef.toBytes(tempID._postfix);
     }
 
     // If _data is an IndexedName, use getID to encode it:
     StringIDRef indexRef;
     if (indexed) {
-        indexRef = getID(tempID._data);
+        indexRef = getIDLocked(tempID._data, Option::Hashable, /*lookupOnly=*/false);
     }
 
     // The real StringID object that we are going to insert
@@ -437,6 +507,7 @@ StringIDRef StringHasher::getID(long id, int index) const
     if (id <= 0) {
         return {};
     }
+    HashLock lock(_hashes->Mutex);
     auto it = _hashes->right.find(id);
     if (it == _hashes->right.end()) {
         return {};
@@ -461,6 +532,7 @@ const std::string& StringHasher::getPersistenceFileName() const
 
 void StringHasher::Save(Base::Writer& writer) const
 {
+    HashLock lock(_hashes->Mutex);
 
     std::size_t count = _hashes->SaveAll ? _hashes->size() : this->count();
 
@@ -489,6 +561,7 @@ void StringHasher::Save(Base::Writer& writer) const
 
 void StringHasher::SaveDocFile(Base::Writer& writer) const
 {
+    HashLock lock(_hashes->Mutex);
     std::size_t count = _hashes->SaveAll ? this->size() : this->count();
     writer.Stream() << "StringTableStart v1 " << count << '\n';
     saveStream(writer.Stream());
@@ -593,6 +666,7 @@ void StringHasher::saveStream(std::ostream& stream) const
 
 void StringHasher::RestoreDocFile(Base::Reader& reader)
 {
+    HashLock lock(_hashes->Mutex);
     std::string marker;
     std::string ver;
     reader >> marker;
@@ -728,6 +802,7 @@ void StringHasher::restoreStreamNew(std::istream& stream, std::size_t count)
 
 StringID* StringHasher::insert(const StringIDRef& sid)
 {
+    HashLock lock(_hashes->Mutex);
     assert(sid && sid._sid->_hasher == nullptr);
     auto& hasher = *sid._sid;
     hasher._hasher = this;
@@ -762,6 +837,7 @@ void StringHasher::restoreStream(std::istream& stream, std::size_t count)
 
 void StringHasher::clear()
 {
+    HashLock lock(_hashes->Mutex);
     for (auto& hasher : _hashes->right) {
         hasher.second->_hasher = nullptr;
         hasher.second->unref();
@@ -771,11 +847,13 @@ void StringHasher::clear()
 
 size_t StringHasher::size() const
 {
+    HashLock lock(_hashes->Mutex);
     return _hashes->size();
 }
 
 size_t StringHasher::count() const
 {
+    HashLock lock(_hashes->Mutex);
     size_t count = 0;
     for (auto& hasher : _hashes->right) {
         if (hasher.second->isMarked() || hasher.second->isPersistent()) {
@@ -787,6 +865,7 @@ size_t StringHasher::count() const
 
 void StringHasher::Restore(Base::XMLReader& reader)
 {
+    HashLock lock(_hashes->Mutex);
     clear();
     reader.readElement("StringHasher");
     _hashes->SaveAll = reader.getAttribute<long>("saveall") != 0L;
@@ -843,6 +922,7 @@ void StringHasher::Restore(Base::XMLReader& reader)
 
 unsigned int StringHasher::getMemSize() const
 {
+    HashLock lock(_hashes->Mutex);
     return (_hashes->SaveAll ? size() : count()) * 10;
 }
 
@@ -853,6 +933,7 @@ PyObject* StringHasher::getPyObject()
 
 std::map<long, StringIDRef> StringHasher::getIDMap() const
 {
+    HashLock lock(_hashes->Mutex);
     std::map<long, StringIDRef> ret;
     for (auto& hasher : _hashes->right) {
         ret.emplace_hint(ret.end(), hasher.first, StringIDRef(hasher.second));
@@ -862,6 +943,7 @@ std::map<long, StringIDRef> StringHasher::getIDMap() const
 
 void StringHasher::clearMarks() const
 {
+    HashLock lock(_hashes->Mutex);
     for (auto& hasher : _hashes->right) {
         hasher.second->_flags.setFlag(StringID::Flag::Marked, false);
     }

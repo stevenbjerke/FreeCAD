@@ -629,6 +629,9 @@ private:
 /// If the string is longer than a given threshold, instead of storing the string, its SHA1 hash is
 /// stored (and the original string discarded). This allows an upper threshold on the length of a
 /// stored string, while still effectively guaranteeing uniqueness in the table.
+///
+/// All member functions may be called from several threads at once. To keep the numbering of new
+/// strings independent of thread timing, see StringHasherOrderGate.
 class AppExport StringHasher: public Base::Persistence, public Base::Handled
 {
 
@@ -777,9 +780,56 @@ protected:
     void restoreStreamNew(std::istream& stream, std::size_t count);
 
 private:
+    // The *Locked variants expect the caller to hold the hash map mutex. With
+    // lookupOnly set they return a null reference instead of inserting.
+    StringIDRef getIDLocked(const QByteArray& data, Options options, bool lookupOnly);
+    StringIDRef getIDLocked(
+        const Data::MappedName& name,
+        const QVector<StringIDRef>& sids,
+        bool lookupOnly
+    );
+
     std::unique_ptr<HashMap>
         _hashes;  ///< Bidirectional map of StringID and its index (a long int).
     mutable std::string _filename;
+};
+
+/** Keeps string ID assignment deterministic when objects recompute concurrently.
+ *
+ * StringHasher numbers new strings in the order they are inserted, and those
+ * numbers become part of topological element names. If several objects
+ * recompute at the same time and insert new strings in whatever order the
+ * threads happen to run, element names would change from run to run.
+ *
+ * A parallel recompute gives each worker thread a gate for the object it is
+ * computing. Before inserting a new string, StringHasher calls waitForTurn(),
+ * which blocks until every object ahead of it in the recompute order has
+ * finished. Looking up strings that already exist never waits, so threads
+ * only serialize when they create new names, and the names come out the same
+ * as when the objects recompute one at a time in that order.
+ *
+ * StringHasher itself is safe to use from several threads; the gate is only
+ * about the order of insertion.
+ */
+class AppExport StringHasherOrderGate
+{
+public:
+    StringHasherOrderGate() = default;
+    StringHasherOrderGate(const StringHasherOrderGate&) = delete;
+    StringHasherOrderGate(StringHasherOrderGate&&) = delete;
+    StringHasherOrderGate& operator=(const StringHasherOrderGate&) = delete;
+    StringHasherOrderGate& operator=(StringHasherOrderGate&&) = delete;
+    virtual ~StringHasherOrderGate() = default;
+
+    /// Block until the calling thread may insert new strings. Must return
+    /// immediately once the turn has been reached.
+    virtual void waitForTurn() = 0;
+
+    /// The gate active on the calling thread, or nullptr outside parallel recompute.
+    static StringHasherOrderGate* current();
+
+    /// Set (or clear, with nullptr) the gate for the calling thread.
+    static void setCurrent(StringHasherOrderGate* gate);
 };
 }  // namespace App
 

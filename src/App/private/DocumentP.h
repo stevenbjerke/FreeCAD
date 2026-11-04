@@ -31,6 +31,7 @@
 #include <map>
 #include <string>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -103,6 +104,8 @@ struct DocumentP
     mutable HasherMap hashers;
     std::multimap<const App::DocumentObject*, std::unique_ptr<App::DocumentObjectExecReturn>>
         _RecomputeLog;
+    // Guards _RecomputeLog and undo recording while objects recompute in parallel.
+    std::recursive_mutex parallelRecomputeMutex;
     ExportInfo exportInfo;
 
     StringHasherRef Hasher {new StringHasher};
@@ -125,6 +128,7 @@ struct DocumentP
             delete returnCode;
             return;
         }
+        std::lock_guard<std::recursive_mutex> lock(parallelRecomputeMutex);
         _RecomputeLog.emplace(returnCode->Which,
                               std::unique_ptr<DocumentObjectExecReturn>(returnCode));
         returnCode->Which->setStatus(ObjectStatus::Error, true);

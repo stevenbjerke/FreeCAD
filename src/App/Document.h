@@ -1422,6 +1422,26 @@ protected:
      */
     int _recomputeFeature(DocumentObject* Feat);
 
+    /**
+     * @brief Recompute objects level by level, running independent ones in parallel.
+     *
+     * Used when the RecomputeThreads document parameter is set. Objects whose
+     * dependencies are all done form a level; within a level, worker-safe objects
+     * recompute concurrently and the rest one at a time. String IDs, notifications
+     * and error handling follow a fixed order, so results do not depend on timing.
+     *
+     * @return false, without recomputing anything, if @p order cannot be split into
+     * levels (a dependency comes after its user); the caller then uses the serial loop.
+     */
+    bool _recomputeInLevels(const std::vector<DocumentObject*>& order,
+                            std::set<DocumentObject*>& filter,
+                            int threads,
+                            bool fineGrained,
+                            bool canAbort,
+                            bool* hasError,
+                            int& objectCount,
+                            bool& aborted);
+
     /// Clear the redos.
     void _clearRedos();
 

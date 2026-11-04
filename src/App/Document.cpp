@@ -35,7 +35,11 @@
 #include <vector>
 #include <list>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 #include <format>
 #include <optional>
 
@@ -77,8 +81,10 @@
 #include "BackupPolicy.h"
 #include "ExpressionParser.h"
 #include "GeoFeature.h"
+#include "GroupExtension.h"
 #include "License.h"
 #include "Link.h"
+#include "MainThreadSignal.h"
 #include "MergeDocuments.h"
 #include "StringHasher.h"
 #include "Transactions.h"
@@ -115,6 +121,93 @@ bool transactionStateBlocksRecoveryWrite(const DocumentP& documentPrivate)
     return documentPrivate.bookedTransaction != NullTransaction
         || documentPrivate.activeUndoTransaction != nullptr || documentPrivate.committing;
 }
+
+// True on a thread that is recomputing an object as part of a parallel batch.
+thread_local bool onParallelRecomputeWorker = false;
+
+/// Worker count for level-by-level recompute. 0 (the default) keeps the classic
+/// serial loop; a negative value means one worker per hardware thread.
+int parallelRecomputeThreads()
+{
+    ParameterGrp::handle hGrp =
+        GetApplication().GetParameterGroupByPath("User parameter:BaseApp/Preferences/Document");
+    long threads = hGrp->GetInt("RecomputeThreads", 0);
+    if (threads < 0) {
+        threads = std::max(1U, std::thread::hardware_concurrency());
+    }
+    return static_cast<int>(threads);
+}
+
+/// Whether an object may recompute on a worker thread alongside others.
+bool isParallelRecomputeCandidate(DocumentObject* obj)
+{
+    if (!obj->canRecomputeOnWorker()) {
+        return false;
+    }
+    // Expressions can call into Python and read arbitrary objects.
+    if (obj->ExpressionEngine.numExpressions() != 0) {
+        return false;
+    }
+    // Groups and links manage other objects (membership, element lists). Their
+    // execute is cheap, so keep them on the scheduling thread.
+    return !obj->hasExtension(GroupExtension::getExtensionClassTypeId())
+        && !obj->hasExtension(LinkBaseExtension::getExtensionClassTypeId());
+}
+
+/** Lets batch entry i insert new strings only after entries 0..i-1 have finished.
+ *
+ * Entries are handed to worker threads in increasing order, so the lowest
+ * unfinished entry is always running and never waits; this cannot deadlock.
+ */
+class RecomputeTurnOrder
+{
+public:
+    explicit RecomputeTurnOrder(size_t count)
+        : finished(count, false)
+    {}
+
+    void waitForTurn(size_t index)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait(lock, [this, index] { return firstUnfinished >= index; });
+    }
+
+    void finish(size_t index)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            finished[index] = true;
+            while (firstUnfinished < finished.size() && finished[firstUnfinished]) {
+                ++firstUnfinished;
+            }
+        }
+        changed.notify_all();
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<bool> finished;
+    size_t firstUnfinished {0};
+};
+
+class RecomputeTicket: public StringHasherOrderGate
+{
+public:
+    RecomputeTicket(RecomputeTurnOrder& order, size_t index)
+        : order(order)
+        , index(index)
+    {}
+
+    void waitForTurn() override
+    {
+        order.waitForTurn(index);
+    }
+
+private:
+    RecomputeTurnOrder& order;
+    size_t index;
+};
 
 }  // namespace
 
@@ -926,6 +1019,11 @@ void Document::onBeforeChangeProperty(const TransactionalObject* Who, const Prop
         signalBeforeChangeObject(*static_cast<const DocumentObject*>(Who), *What);
     }
     if (!d->rollback && !globalIsRelabeling && !d->definingTransaction) {
+        // Undo recording is not thread-safe; serialize it between parallel workers.
+        std::unique_lock<std::recursive_mutex> lock(d->parallelRecomputeMutex, std::defer_lock);
+        if (onParallelRecomputeWorker) {
+            lock.lock();
+        }
         _checkTransaction(nullptr, What, __LINE__);
         if (d->activeUndoTransaction) {
             d->activeUndoTransaction->addObjectChange(Who, What);
@@ -2941,8 +3039,53 @@ int Document::recompute(const std::vector<DocumentObject*>& objs,
     try {
         std::set<DocumentObject*> filter;
         size_t idx = 0;
+        int firstPass = 0;
+
+        // check if all objects are recomputed but still touched
+        auto checkStillTouched = [&](int passes) {
+            for (size_t i = 0; i < topoSortedObjects.size(); ++i) {
+                auto obj = topoSortedObjects[i];
+                obj->setStatus(ObjectStatus::Recompute2, false);
+                if (!filter.contains(obj) && obj->isTouched()) {
+                    if (passes > 0) {
+                        FC_ERR(obj->getFullName() << " still touched after recompute");
+                    }
+                    else {
+                        FC_LOG(obj->getFullName() << " still touched after recompute");
+                        if (idx >= topoSortedObjects.size()) {
+                            // let's start the next pass on the first touched object
+                            idx = i;
+                        }
+                        obj->setStatus(ObjectStatus::Recompute2, true);
+                    }
+                }
+            }
+        };
+
+        if (const int threads = parallelRecomputeThreads(); threads > 0) {
+            bool aborted = false;
+            if (_recomputeInLevels(topoSortedObjects,
+                                   filter,
+                                   threads,
+                                   fineGrained,
+                                   canAbort,
+                                   hasError,
+                                   objectCount,
+                                   aborted)) {
+                // Only objects left touched afterwards go through the serial loop below.
+                idx = topoSortedObjects.size();
+                if (aborted) {
+                    firstPass = 2;
+                }
+                else {
+                    checkStillTouched(0);
+                    firstPass = 1;
+                }
+            }
+        }
+
         // maximum two passes to allow some form of dependency inversion
-        for (int passes = 0; passes < 2 && idx < topoSortedObjects.size(); ++passes) {
+        for (int passes = firstPass; passes < 2 && idx < topoSortedObjects.size(); ++passes) {
             std::unique_ptr<Base::SequencerLauncher> seq;
             if (canAbort) {
                 seq = std::make_unique<Base::SequencerLauncher>("Recompute...",
@@ -2999,24 +3142,7 @@ int Document::recompute(const std::vector<DocumentObject*>& objs,
                     seq->next(true);
                 }
             }
-            // check if all objects are recomputed but still thouched
-            for (size_t i = 0; i < topoSortedObjects.size(); ++i) {
-                auto obj = topoSortedObjects[i];
-                obj->setStatus(ObjectStatus::Recompute2, false);
-                if (!filter.contains(obj) && obj->isTouched()) {
-                    if (passes > 0) {
-                        FC_ERR(obj->getFullName() << " still touched after recompute");
-                    }
-                    else {
-                        FC_LOG(obj->getFullName() << " still touched after recompute");
-                        if (idx >= topoSortedObjects.size()) {
-                            // let's start the next pass on the first touched object
-                            idx = i;
-                        }
-                        obj->setStatus(ObjectStatus::Recompute2, true);
-                    }
-                }
-            }
+            checkStillTouched(passes);
         }
     }
     catch (Base::Exception& e) {
@@ -3316,6 +3442,190 @@ int Document::_recomputeFeature(DocumentObject* Feat) // NOLINT
         return 1;
     }
     return 0;
+}
+
+bool Document::_recomputeInLevels(const std::vector<DocumentObject*>& order,
+                                  std::set<DocumentObject*>& filter,
+                                  int threads,
+                                  bool fineGrained,
+                                  bool canAbort,
+                                  bool* hasError,
+                                  int& objectCount,
+                                  bool& aborted)
+{
+    // Level of each object: 0 if it depends on nothing being recomputed, else one
+    // more than its deepest dependency. Objects on the same level are independent.
+    std::unordered_map<DocumentObject*, size_t> position;
+    position.reserve(order.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        position.emplace(order[i], i);
+    }
+    std::vector<size_t> level(order.size(), 0);
+    size_t levelCount = 0;
+    for (size_t i = 0; i < order.size(); ++i) {
+        for (auto* dep : order[i]->getOutList()) {
+            auto it = position.find(dep);
+            if (it == position.end()) {
+                continue;
+            }
+            if (it->second >= i) {
+                // A dependency that comes later in the order (cycle or inverted
+                // dependency): leave the whole recompute to the serial loop.
+                return false;
+            }
+            level[i] = std::max(level[i], level[it->second] + 1);
+        }
+        levelCount = std::max(levelCount, level[i] + 1);
+    }
+
+    std::vector<std::vector<DocumentObject*>> levels(levelCount);
+    for (size_t i = 0; i < order.size(); ++i) {
+        levels[level[i]].push_back(order[i]);
+    }
+
+    std::unique_ptr<Base::SequencerLauncher> seq;
+    if (canAbort) {
+        seq = std::make_unique<Base::SequencerLauncher>("Recompute...", order.size());
+    }
+
+    // Bookkeeping after an object was (or did not need to be) recomputed, the same
+    // as in the serial loop. Returns false if the user aborted the recompute.
+    auto finishObject = [&](DocumentObject* obj, bool doRecompute, int res) {
+        if (doRecompute && res != 0) {
+            if (hasError) {
+                *hasError = true;
+            }
+            if (res < 0) {
+                return false;
+            }
+            // skip everything that depends on the failed object
+            obj->getInListEx(filter, true);
+            filter.insert(obj);
+            return true;
+        }
+        if (obj->isTouched() || doRecompute) {
+            signalRecomputedObject(*obj);
+            if (fineGrained) {
+                for (auto& [objFrom, propFrom, objTo, propTo] : obj->getInListProp()) {
+                    if (obj->touchedProps.contains(propTo) || propTo.empty()) {
+                        objFrom->enforceRecompute(propFrom);
+                    }
+                }
+                obj->purgeTouched();
+            }
+            else {
+                obj->purgeTouched();
+                for (auto inObjIt : obj->getInList()) {
+                    inObjIt->enforceRecompute();
+                }
+            }
+        }
+        if (seq) {
+            seq->next(true);
+        }
+        return true;
+    };
+
+    auto replay = [](MainThreadSignalConfig::DeferredQueue& queue) {
+        for (auto& notify : queue) {
+            try {
+                notify();
+            }
+            catch (Base::Exception& e) {
+                e.reportException();
+            }
+            catch (std::exception& e) {
+                FC_ERR("Exception in recompute notification: " << e.what());
+            }
+        }
+    };
+
+    for (const auto& objects : levels) {
+        std::vector<DocumentObject*> batch;
+        std::vector<DocumentObject*> serial;
+        for (auto* obj : objects) {
+            if (!obj->isAttachedToDocument() || filter.contains(obj)) {
+                continue;
+            }
+            if (obj->mustRecompute() && isParallelRecomputeCandidate(obj)) {
+                batch.push_back(obj);
+            }
+            else {
+                serial.push_back(obj);
+            }
+        }
+
+        if (!batch.empty()) {
+            std::vector<int> results(batch.size(), 0);
+            std::vector<MainThreadSignalConfig::DeferredQueue> deferred(batch.size());
+            RecomputeTurnOrder turns(batch.size());
+            std::atomic<size_t> next {0};
+
+            auto work = [&]() {
+                onParallelRecomputeWorker = true;
+                for (size_t i = next++; i < batch.size(); i = next++) {
+                    RecomputeTicket ticket(turns, i);
+                    StringHasherOrderGate::setCurrent(&ticket);
+                    MainThreadSignalConfig::setDeferredQueue(&deferred[i]);
+                    try {
+                        results[i] = _recomputeFeature(batch[i]);
+                    }
+                    catch (...) {
+                        d->addRecomputeLog("Unknown exception!", batch[i]);
+                        results[i] = 1;
+                    }
+                    MainThreadSignalConfig::setDeferredQueue(nullptr);
+                    StringHasherOrderGate::setCurrent(nullptr);
+                    turns.finish(i);
+                }
+                onParallelRecomputeWorker = false;
+            };
+
+            {
+                // C++ features run without the GIL; code that needs Python takes it.
+                Base::PyGILStateRelease release;
+                const size_t extra = std::min<size_t>(threads, batch.size()) - 1;
+                std::vector<std::thread> pool;
+                pool.reserve(extra);
+                for (size_t t = 0; t < extra; ++t) {
+                    pool.emplace_back(work);
+                }
+                work();
+                for (auto& thread : pool) {
+                    thread.join();
+                }
+            }
+
+            // Deliver notifications and propagate in recompute order, as the
+            // serial loop would have done.
+            for (size_t i = 0; i < batch.size(); ++i) {
+                ++objectCount;
+                replay(deferred[i]);
+                if (!finishObject(batch[i], true, results[i])) {
+                    aborted = true;
+                    return true;
+                }
+            }
+        }
+
+        for (auto* obj : serial) {
+            if (!obj->isAttachedToDocument() || filter.contains(obj)) {
+                continue;
+            }
+            bool doRecompute = false;
+            int res = 0;
+            if (obj->mustRecompute()) {
+                doRecompute = true;
+                ++objectCount;
+                res = _recomputeFeature(obj);
+            }
+            if (!finishObject(obj, doRecompute, res)) {
+                aborted = true;
+                return true;
+            }
+        }
+    }
+    return true;
 }
 
 bool Document::recomputeFeature(DocumentObject* feature, bool recursive)

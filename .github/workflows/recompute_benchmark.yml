@@ -1,0 +1,232 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# Builds a baseline and a candidate FreeCAD, runs the recompute benchmark on
+# both and compares speed, memory, geometry and topological element names.
+# The candidate also runs the Part, PartDesign, Sketcher and Assembly unit
+# tests with the level scheduler enabled.
+#
+# Results appear in the run summary and as the "recompute-benchmark" artifact.
+
+name: Recompute benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: "Commit, branch or tag to compare against (empty: tools/benchmark/BASELINE)"
+        required: false
+        default: ""
+      repeat:
+        description: "Timed recomputes per run"
+        required: false
+        default: "5"
+  push:
+    branches:
+      - parallel-recompute-research
+    paths:
+      - "src/App/**"
+      - "src/Mod/Part/**"
+      - "src/Mod/PartDesign/**"
+      - "src/Mod/Assembly/**"
+      - "tools/benchmark/**"
+      - ".github/workflows/recompute_benchmark.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recompute-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same module set as the local development build: everything the Part,
+  # PartDesign, Sketcher and Assembly workbenches need, nothing else.
+  CMAKE_MODULE_ARGS: >-
+    -DBUILD_FEM=OFF -DBUILD_FEM_NETGEN=OFF -DBUILD_CAM=OFF -DBUILD_BIM=OFF
+    -DBUILD_OPENSCAD=OFF -DBUILD_ROBOT=OFF -DBUILD_REVERSEENGINEERING=OFF
+    -DBUILD_POINTS=OFF -DBUILD_INSPECTION=OFF -DBUILD_MESH=OFF -DBUILD_MESH_PART=OFF
+    -DBUILD_FLAT_MESH=OFF -DBUILD_SURFACE=OFF -DBUILD_PLOT=OFF -DBUILD_WEB=OFF
+    -DBUILD_TUX=OFF -DBUILD_HELP=OFF -DBUILD_ADDONMGR=OFF -DBUILD_START=OFF
+    -DBUILD_JTREADER=OFF -DBUILD_TEMPLATE=OFF -DBUILD_DRAFT=ON -DBUILD_TECHDRAW=ON
+  MODELS: "part_trees pd_pattern pd_bodies assembly"
+  CANDIDATE_THREADS: "0 1 2 4"
+  UNIT_TESTS: "TestPartApp TestPartDesignApp TestSketcherApp TestAssemblyWorkbench"
+
+jobs:
+  build-and-run:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, candidate]
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPRESS: true
+      CCACHE_COMPRESSLEVEL: 5
+      CCACHE_NOHASHDIR: true
+      CCACHE_SLOPPINESS: "include_file_ctime,include_file_mtime,pch_defines,time_macros"
+      CCACHE_COMPILERCHECK: "%compiler% -dumpfullversion -dumpversion"
+      REPEAT: ${{ inputs.repeat || '5' }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Check out benchmark scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: bench
+          sparse-checkout: tools/benchmark
+
+      - name: Resolve source commit
+        id: ref
+        env:
+          VARIANT: ${{ matrix.variant }}
+          BASELINE_INPUT: ${{ inputs.baseline_ref }}
+        run: |
+          if [ "$VARIANT" = candidate ]; then
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          elif [ -n "$BASELINE_INPUT" ]; then
+            echo "sha=$BASELINE_INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$(tr -d '[:space:]' < bench/tools/benchmark/BASELINE)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out FreeCAD (${{ matrix.variant }})
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: freecad
+          ref: ${{ steps.ref.outputs.sha }}
+          submodules: recursive
+
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+        with:
+          pixi-version: v0.82.1
+          manifest-path: freecad/pixi.toml
+          cache: false
+          locked: true
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: recompute-bench-${{ matrix.variant }}-${{ steps.ref.outputs.sha }}
+          restore-keys: |
+            recompute-bench-${{ matrix.variant }}-
+            recompute-bench-
+
+      - name: Configure
+        working-directory: freecad
+        run: |
+          pixi run -- env CFLAGS= CXXFLAGS= DEBUG_CFLAGS= DEBUG_CXXFLAGS= \
+            cmake --preset conda-linux-release $CMAKE_MODULE_ARGS
+
+      - name: Build
+        working-directory: freecad
+        run: |
+          pixi run ccache -z
+          pixi run cmake --build build/release -j "$(nproc)"
+          pixi run ccache -s
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: recompute-bench-${{ matrix.variant }}-${{ steps.ref.outputs.sha }}
+
+      - name: Describe machine
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)|Thread|MHz" || true
+          free -g
+
+      - name: Run benchmarks
+        working-directory: freecad
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/results/$VARIANT"
+          if [ "$VARIANT" = candidate ]; then threads="$CANDIDATE_THREADS"; else threads="none"; fi
+          status=0
+          for model in $MODELS; do
+            for t in $threads; do
+              out="$GITHUB_WORKSPACE/results/$VARIANT/$model-t$t.json"
+              extra=""
+              [ "$t" != none ] && extra="--threads $t"
+              echo "::group::$model threads=$t"
+              pixi run python "$GITHUB_WORKSPACE/bench/tools/benchmark/recompute_bench.py" \
+                --freecad-lib build/release/lib --model "$model" --repeat "$REPEAT" \
+                --label "$VARIANT" --out "$out" $extra || { echo "::error::$model threads=$t failed"; status=1; }
+              echo "::endgroup::"
+            done
+          done
+          exit $status
+
+      - name: Unit tests with the level scheduler
+        if: matrix.variant == 'candidate'
+        working-directory: freecad
+        run: |
+          set -o pipefail
+          status=0
+          for t in 0 4; do
+            echo "::group::RecomputeThreads=$t"
+            pixi run python "$GITHUB_WORKSPACE/bench/tools/benchmark/run_tests.py" \
+              --freecad-lib build/release/lib --threads "$t" $UNIT_TESTS \
+              2>&1 | tee "$GITHUB_WORKSPACE/results/$VARIANT-tests-t$t.log" \
+              || { echo "::error::unit tests failed with RecomputeThreads=$t"; status=1; }
+            echo "::endgroup::"
+          done
+          exit $status
+        env:
+          VARIANT: ${{ matrix.variant }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-${{ matrix.variant }}
+          path: results/
+          if-no-files-found: warn
+
+  compare:
+    needs: build-and-run
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out benchmark scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: tools/benchmark
+
+      - name: Download results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: results-*
+          path: results
+          merge-multiple: true
+
+      - name: Compare
+        run: |
+          status=0
+          python3 tools/benchmark/compare_results.py results/baseline results/candidate \
+            --markdown comparison.md || status=$?
+          {
+            echo "## Recompute benchmark"
+            echo
+            cat comparison.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - name: Upload comparison
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: recompute-benchmark
+          path: |
+            comparison.md
+            results/

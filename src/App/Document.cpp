@@ -39,6 +39,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <mutex>
+#include <system_error>
 #include <thread>
 #include <format>
 #include <optional>
@@ -3506,7 +3507,9 @@ bool Document::_recomputeInLevels(const std::vector<DocumentObject*>& order,
         if (obj->isTouched() || doRecompute) {
             signalRecomputedObject(*obj);
             if (fineGrained) {
-                for (auto& [objFrom, propFrom, objTo, propTo] : obj->getInListProp()) {
+                // copy: enforceRecompute() signals observers that may change the list
+                std::vector<DepEdge> inList = obj->getInListProp();
+                for (auto& [objFrom, propFrom, objTo, propTo] : inList) {
                     if (obj->touchedProps.contains(propTo) || propTo.empty()) {
                         objFrom->enforceRecompute(propFrom);
                     }
@@ -3588,7 +3591,14 @@ bool Document::_recomputeInLevels(const std::vector<DocumentObject*>& order,
                 std::vector<std::thread> pool;
                 pool.reserve(extra);
                 for (size_t t = 0; t < extra; ++t) {
-                    pool.emplace_back(work);
+                    try {
+                        pool.emplace_back(work);
+                    }
+                    catch (const std::system_error& e) {
+                        // Carry on with the threads we have; work() shares out the batch.
+                        FC_WARN("Parallel recompute: could not start worker thread: " << e.what());
+                        break;
+                    }
                 }
                 work();
                 for (auto& thread : pool) {

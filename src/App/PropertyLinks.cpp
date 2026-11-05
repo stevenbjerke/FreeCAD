@@ -23,6 +23,7 @@
  ***************************************************************************/
 
 #include <algorithm>
+#include <mutex>
 #include <set>
 
 #include <QDir>
@@ -64,6 +65,16 @@ TYPESYSTEM_SOURCE_ABSTRACT(App::PropertyLinkBase, App::Property)
 // clang-format off
 static std::unordered_map<std::string, std::set<PropertyLinkBase*>> _LabelMap;
 static std::unordered_map<App::DocumentObject*, std::unordered_set<PropertyLinkBase*>> _ElementRefMap;
+
+// Guards _LabelMap and _ElementRefMap. Link properties register references when
+// their value changes, which happens on parallel recompute workers too (for
+// example Part::Fillet updates its EdgeLinks while executing).
+static std::recursive_mutex& referenceMapMutex()
+{
+    static std::recursive_mutex mutex;
+    return mutex;
+}
+using ReferenceMapLock = std::lock_guard<std::recursive_mutex>;
 // clang-format on
 
 PropertyLinkBase::PropertyLinkBase() = default;
@@ -127,6 +138,7 @@ bool PropertyLinkBase::isSame(const Property& other) const
 
 void PropertyLinkBase::unregisterElementReference()
 {
+    ReferenceMapLock lock(referenceMapMutex());
     for (auto obj : _ElementRefs) {
         auto it = _ElementRefMap.find(obj);
         if (it != _ElementRefMap.end()) {
@@ -141,6 +153,7 @@ void PropertyLinkBase::unregisterElementReference()
 
 void PropertyLinkBase::unregisterLabelReferences()
 {
+    ReferenceMapLock lock(referenceMapMutex());
     for (auto& label : _LabelRefs) {
         auto it = _LabelMap.find(label);
         if (it != _LabelMap.end()) {
@@ -171,6 +184,7 @@ void PropertyLinkBase::registerLabelReferences(std::vector<std::string>&& labels
     if (reset) {
         unregisterLabelReferences();
     }
+    ReferenceMapLock lock(referenceMapMutex());
     for (auto& label : labels) {
         auto res = _LabelRefs.insert(std::move(label));
         if (res.second) {
@@ -226,16 +240,19 @@ PropertyLinkBase::updateLabelReferences(App::DocumentObject* obj, const char* ne
     if (!obj || !obj->isAttachedToDocument()) {
         return ret;
     }
-    auto it = _LabelMap.find(obj->Label.getStrValue());
-    if (it == _LabelMap.end()) {
-        return ret;
+    std::vector<PropertyLinkBase*> props;
+    {
+        ReferenceMapLock lock(referenceMapMutex());
+        auto it = _LabelMap.find(obj->Label.getStrValue());
+        if (it == _LabelMap.end()) {
+            return ret;
+        }
+        props.reserve(it->second.size());
+        props.insert(props.end(), it->second.begin(), it->second.end());
     }
     std::string ref("$");
     ref += obj->Label.getValue();
     ref += '.';
-    std::vector<PropertyLinkBase*> props;
-    props.reserve(it->second.size());
-    props.insert(props.end(), it->second.begin(), it->second.end());
     for (auto prop : props) {
         if (!prop->getContainer()) {
             continue;
@@ -262,14 +279,14 @@ static std::string propertyName(const Property* prop)
     return prop->getFullName();
 }
 
-const std::unordered_set<PropertyLinkBase*>&
+std::unordered_set<PropertyLinkBase*>
 PropertyLinkBase::getElementReferences(DocumentObject* feature)
 {
-    static std::unordered_set<PropertyLinkBase*> none;
-
+    // A copy: the registry may change on another thread while the caller iterates.
+    ReferenceMapLock lock(referenceMapMutex());
     auto it = _ElementRefMap.find(feature);
     if (it == _ElementRefMap.end()) {
-        return none;
+        return {};
     }
 
     return it->second;
@@ -280,13 +297,16 @@ void PropertyLinkBase::updateElementReferences(DocumentObject* feature, bool rev
     if (!feature || !feature->getNameInDocument()) {
         return;
     }
-    auto it = _ElementRefMap.find(feature);
-    if (it == _ElementRefMap.end()) {
-        return;
-    }
     std::vector<PropertyLinkBase*> props;
-    props.reserve(it->second.size());
-    props.insert(props.end(), it->second.begin(), it->second.end());
+    {
+        ReferenceMapLock lock(referenceMapMutex());
+        auto it = _ElementRefMap.find(feature);
+        if (it == _ElementRefMap.end()) {
+            return;
+        }
+        props.reserve(it->second.size());
+        props.insert(props.end(), it->second.begin(), it->second.end());
+    }
     for (auto prop : props) {
         if (prop->getContainer()) {
             try {
@@ -313,7 +333,12 @@ void PropertyLinkBase::updateAllElementReferences(const std::vector<App::Documen
         }
     }
 
-    for (auto reference : _ElementRefMap) {
+    std::vector<std::pair<App::DocumentObject*, std::unordered_set<PropertyLinkBase*>>> references;
+    {
+        ReferenceMapLock lock(referenceMapMutex());
+        references.assign(_ElementRefMap.begin(), _ElementRefMap.end());
+    }
+    for (auto& reference : references) {
         const bool targetIsNew = newDocSet.contains(reference.first->getDocument());
         for (auto prop : reference.second) {
             if (prop->getContainer()) {
@@ -364,6 +389,7 @@ void PropertyLinkBase::_registerElementReference(App::DocumentObject* obj,
     }
 
     if (_ElementRefs.insert(geo).second) {
+        ReferenceMapLock lock(referenceMapMutex());
         _ElementRefMap[geo].insert(this);
     }
 }
@@ -487,6 +513,7 @@ bool PropertyLinkBase::_updateElementReference(DocumentObject* feature,
     }
 
     if (_ElementRefs.insert(geo).second) {
+        ReferenceMapLock lock(referenceMapMutex());
         _ElementRefMap[geo].insert(this);
     }
 

@@ -397,8 +397,9 @@ public:
     /// Update all element references in the _ElementRefMap
     static void updateAllElementReferences(const std::vector<DocumentT>& newDocs, bool reverse = false);
 
-    /// Obtain link properties that contain element references to a given object
-    static const std::unordered_set<PropertyLinkBase*>& getElementReferences(DocumentObject*);
+    /// Obtain (a copy of the set of) link properties that contain element references to a
+    /// given object
+    static std::unordered_set<PropertyLinkBase*> getElementReferences(DocumentObject*);
 
     /**
      * @brief Update individual element references.

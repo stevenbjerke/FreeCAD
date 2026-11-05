@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
+#include <mutex>
 #include <unordered_map>
 #ifndef FC_DEBUG
 #include <random>
@@ -48,9 +49,9 @@ static std::unordered_map<unsigned, ElementMapPtr> _idToElementMap;
 
 void ElementMap::init()
 {
-    static bool inited;
-    if (!inited) {
-        inited = true;
+    // Element maps are created on parallel recompute workers too; connect only once.
+    static std::once_flag once;
+    std::call_once(once, []() {
         ::App::GetApplication().signalStartSaveDocument.connect(
             [](const ::App::Document&, const std::string&) {
                 _elementMapToId.clear();
@@ -65,7 +66,7 @@ void ElementMap::init()
         ::App::GetApplication().signalFinishRestoreDocument.connect([](const ::App::Document&) {
             _idToElementMap.clear();
         });
-    }
+    });
 }
 
 ElementMap::ElementMap()

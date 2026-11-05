@@ -239,13 +239,15 @@ struct PropertyCleaner
 
     Property* prop;
 
-    static std::vector<Property*> _RemovedProps;
-    static int _PropCleanerCounter;
+    // Per thread: properties are set on parallel recompute workers too, and each thread
+    // only defers deleting the properties removed while its own onChanged() is active.
+    static thread_local std::vector<Property*> _RemovedProps;
+    static thread_local int _PropCleanerCounter;
 };
 }  // namespace App
 
-std::vector<Property*> PropertyCleaner::_RemovedProps;
-int PropertyCleaner::_PropCleanerCounter = 0;
+thread_local std::vector<Property*> PropertyCleaner::_RemovedProps;
+thread_local int PropertyCleaner::_PropCleanerCounter = 0;
 
 void Property::destroy(Property* p)
 {

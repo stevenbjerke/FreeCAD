@@ -21,6 +21,7 @@
  *                                                                         *
  **************************************************************************/
 
+#include <mutex>
 #include <random>
 
 
@@ -184,9 +185,15 @@ std::shared_ptr<App::Material> MaterialManager::defaultAppearance()
 
 std::shared_ptr<Material> MaterialManager::defaultMaterial()
 {
-    MaterialManager manager;
-
     auto mat = defaultAppearance();
+
+    // The default material is the shared instance from the material cache, and this
+    // updates its appearance. Part features call this while recomputing, possibly on
+    // several parallel recompute workers, so update it under a lock and hand out a copy
+    // instead of the shared instance.
+    static std::mutex defaultMaterialMutex;
+    std::lock_guard<std::mutex> lock(defaultMaterialMutex);
+
     auto material = getManager().getMaterial(defaultMaterialUUID());
     if (!material) {
         material = getManager().getMaterial(QStringLiteral("7f9fd73b-50c9-41d8-b7b2-575a030c1eeb"));
@@ -206,7 +213,7 @@ std::shared_ptr<Material> MaterialManager::defaultMaterial()
             ->setFloat(mat->shininess);
     }
 
-    return material;
+    return std::make_shared<Material>(*material);
 }
 
 QString MaterialManager::defaultMaterialUUID()
@@ -525,9 +532,7 @@ std::shared_ptr<Material> MaterialManager::getMaterial(const QString& uuid) cons
 
 std::shared_ptr<Material> MaterialManager::getMaterial(const App::Material& material)
 {
-    MaterialManager manager;
-
-    return manager.getMaterial(QString::fromStdString(material.uuid));
+    return getManager().getMaterial(QString::fromStdString(material.uuid));
 }
 
 std::shared_ptr<Material> MaterialManager::getMaterialByPath(const QString& path) const

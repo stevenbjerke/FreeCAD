@@ -10,5 +10,3 @@ race:libpython
 race:libQt
 race:libtbb
 race:libxerces
-called_from_lib:libTK
-called_from_lib:libpython

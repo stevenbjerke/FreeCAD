@@ -193,6 +193,106 @@ jobs:
           path: results/
           if-no-files-found: warn
 
+  thread-sanitizer:
+    # Builds the candidate with -fsanitize=thread and runs every model with the
+    # level scheduler, to find data races directly instead of waiting for crashes.
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPRESS: true
+      CCACHE_COMPRESSLEVEL: 5
+      CCACHE_NOHASHDIR: true
+      CCACHE_SLOPPINESS: "include_file_ctime,include_file_mtime,pch_defines,time_macros"
+      CCACHE_COMPILERCHECK: "%compiler% -dumpfullversion -dumpversion"
+      TSAN_FLAGS: "-fsanitize=thread -shared-libsan -g -O1"
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Check out FreeCAD (candidate)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: freecad
+          submodules: recursive
+
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+        with:
+          pixi-version: v0.82.1
+          manifest-path: freecad/pixi.toml
+          cache: false
+          locked: true
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: recompute-bench-tsan-${{ github.sha }}
+          restore-keys: |
+            recompute-bench-tsan-
+
+      - name: Configure
+        working-directory: freecad
+        run: |
+          pixi run -- env CFLAGS= CXXFLAGS= DEBUG_CFLAGS= DEBUG_CXXFLAGS= \
+            cmake --preset conda-linux-release -B build/tsan $CMAKE_MODULE_ARGS \
+              -DFREECAD_WARN_ERROR=OFF \
+              "-DCMAKE_C_FLAGS=$TSAN_FLAGS" "-DCMAKE_CXX_FLAGS=$TSAN_FLAGS" \
+              "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread -shared-libsan" \
+              "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread -shared-libsan" \
+              "-DCMAKE_MODULE_LINKER_FLAGS=-fsanitize=thread -shared-libsan"
+
+      - name: Build
+        working-directory: freecad
+        run: |
+          pixi run ccache -z
+          pixi run cmake --build build/tsan -j "$(nproc)"
+          pixi run ccache -s
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: recompute-bench-tsan-${{ github.sha }}
+
+      - name: Run models under ThreadSanitizer
+        working-directory: freecad
+        run: |
+          # Ubuntu's default ASLR entropy breaks the TSan runtime's memory layout.
+          sudo sysctl vm.mmap_rnd_bits=28
+          runtime=$(pixi run clang++ -print-file-name=libclang_rt.tsan-x86_64.so)
+          mkdir -p "$GITHUB_WORKSPACE/tsan"
+          export TSAN_OPTIONS="suppressions=$PWD/tools/benchmark/tsan.supp:halt_on_error=0:report_signal_unsafe=0:history_size=4:log_path=$GITHUB_WORKSPACE/tsan/tsan"
+          for model in $MODELS; do
+            echo "::group::$model"
+            pixi run env LD_PRELOAD="$runtime" python tools/benchmark/recompute_bench.py \
+              --freecad-lib build/tsan/lib --model "$model" --repeat 1 --threads 4 \
+              --out "$GITHUB_WORKSPACE/tsan/$model.json" \
+              || echo "::warning::$model exited with an error under TSan"
+            echo "::endgroup::"
+          done
+
+      - name: Summarize races
+        if: always()
+        working-directory: freecad
+        run: |
+          status=0
+          python3 tools/benchmark/tsan_summary.py "$GITHUB_WORKSPACE/tsan" --markdown tsan.md || status=$?
+          { echo "## ThreadSanitizer"; echo; cat tsan.md; } >> "$GITHUB_STEP_SUMMARY"
+          cp tsan.md "$GITHUB_WORKSPACE/tsan/" || true
+          exit $status
+
+      - name: Upload TSan logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: thread-sanitizer
+          path: tsan/
+          if-no-files-found: warn
+
   compare:
     needs: build-and-run
     if: always()

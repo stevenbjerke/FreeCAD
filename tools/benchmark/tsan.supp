@@ -1,0 +1,14 @@
+# ThreadSanitizer suppressions for the recompute benchmark (TSAN_OPTIONS=suppressions=...).
+#
+# Only FreeCAD is built with -fsanitize=thread. OCCT, Python, Qt and the other
+# libraries from the build environment are not instrumented, so TSan cannot see
+# the synchronization inside them (OCCT's thread pool, the GIL) and reports races
+# there that are not real. Suppress reports involving those libraries so that the
+# remaining reports point at FreeCAD code.
+race:libTK
+race:libpython
+race:libQt
+race:libtbb
+race:libxerces
+called_from_lib:libTK
+called_from_lib:libpython

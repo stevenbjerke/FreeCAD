@@ -41,6 +41,10 @@
 #include <chrono>
 #include <string>
 #include <utility>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <vector>
 
 #include <FCConfig.h>
 
@@ -65,6 +69,83 @@ using namespace Base;
 
 
 #include "XMLTools.h"
+
+namespace
+{
+// ParameterGrp is used from recompute worker threads, so every access to the
+// parameter trees is serialized by one recursive mutex. Change notifications
+// raised while it is held are delivered only after the outermost lock on the
+// thread is released: observers (including Python ones, which take the GIL)
+// therefore never run under the mutex and cannot deadlock against it.
+std::recursive_mutex& parameterMutex()
+{
+    static std::recursive_mutex mutex;
+    return mutex;
+}
+
+thread_local int parameterLockDepth = 0;
+thread_local std::vector<std::function<void()>> pendingParameterNotifications;
+
+class ParameterLock
+{
+public:
+    ParameterLock()
+    {
+        parameterMutex().lock();
+        ++parameterLockDepth;
+    }
+    ~ParameterLock()
+    {
+        if (--parameterLockDepth > 0) {
+            parameterMutex().unlock();
+            return;
+        }
+        auto pending = std::move(pendingParameterNotifications);
+        pendingParameterNotifications.clear();
+        parameterMutex().unlock();
+        for (auto& notify : pending) {
+            try {
+                notify();
+            }
+            catch (const Base::Exception& e) {
+                e.reportException();
+            }
+            catch (const std::exception& e) {
+                Base::Console().error("Exception in parameter observer: {}\n", e.what());
+            }
+        }
+    }
+    ParameterLock(const ParameterLock&) = delete;
+    ParameterLock(ParameterLock&&) = delete;
+    ParameterLock& operator=(const ParameterLock&) = delete;
+    ParameterLock& operator=(ParameterLock&&) = delete;
+};
+
+void notifyWhenUnlocked(std::function<void()> notify)
+{
+    if (parameterLockDepth > 0) {
+        pendingParameterNotifications.push_back(std::move(notify));
+    }
+    else {
+        notify();
+    }
+}
+
+std::optional<std::string> optionalString(const char* text)
+{
+    return text ? std::optional<std::string>(text) : std::nullopt;
+}
+
+const char* cString(const std::optional<std::string>& text)
+{
+    return text ? text->c_str() : nullptr;
+}
+
+void notifyObserversWhenUnlocked(ParameterGrp* group, const char* name)
+{
+    notifyWhenUnlocked([group, name = optionalString(name)]() { group->Notify(cString(name)); });
+}
+}  // namespace
 
 //**************************************************************************
 //**************************************************************************
@@ -202,6 +283,7 @@ ParameterGrp::~ParameterGrp()
 
 void ParameterGrp::copyTo(const Base::Reference<ParameterGrp>& Grp)
 {
+    ParameterLock lock;
     if (Grp == this) {
         return;
     }
@@ -215,6 +297,7 @@ void ParameterGrp::copyTo(const Base::Reference<ParameterGrp>& Grp)
 
 void ParameterGrp::insertTo(const Base::Reference<ParameterGrp>& Grp)
 {
+    ParameterLock lock;
     if (Grp == this) {
         return;
     }
@@ -264,6 +347,7 @@ void ParameterGrp::insertTo(const Base::Reference<ParameterGrp>& Grp)
 
 void ParameterGrp::exportTo(const char* FileName)
 {
+    ParameterLock lock;
     auto Mngr = ParameterManager::Create();
 
     Mngr->CreateDocument();
@@ -276,6 +360,7 @@ void ParameterGrp::exportTo(const char* FileName)
 
 void ParameterGrp::importFrom(const char* FileName)
 {
+    ParameterLock lock;
     auto Mngr = ParameterManager::Create();
 
     if (Mngr->LoadDocument(FileName) != 1) {
@@ -287,6 +372,7 @@ void ParameterGrp::importFrom(const char* FileName)
 
 void ParameterGrp::insert(const char* FileName)
 {
+    ParameterLock lock;
     auto Mngr = ParameterManager::Create();
 
     if (Mngr->LoadDocument(FileName) != 1) {
@@ -298,6 +384,7 @@ void ParameterGrp::insert(const char* FileName)
 
 void ParameterGrp::revert(const char* FileName)
 {
+    ParameterLock lock;
     auto Mngr = ParameterManager::Create();
 
     if (Mngr->LoadDocument(FileName) != 1) {
@@ -309,6 +396,7 @@ void ParameterGrp::revert(const char* FileName)
 
 void ParameterGrp::revert(const Base::Reference<ParameterGrp>& Grp)
 {
+    ParameterLock lock;
     if (Grp == this) {
         return;
     }
@@ -352,6 +440,7 @@ void ParameterGrp::revert(const Base::Reference<ParameterGrp>& Grp)
 
 DOMElement* ParameterGrp::CreateElement(DOMElement* Start, const char* Type, const char* Name)
 {
+    ParameterLock lock;
     if (XMLString::compareString(Start->getNodeName(), XStrLiteral("FCParamGroup").unicodeForm()) != 0
         && XMLString::compareString(Start->getNodeName(), XStrLiteral("FCParameters").unicodeForm())
             != 0) {
@@ -380,6 +469,7 @@ DOMElement* ParameterGrp::CreateElement(DOMElement* Start, const char* Type, con
 
 Base::Reference<ParameterGrp> ParameterGrp::GetGroup(const char* Name)
 {
+    ParameterLock lock;
     if (!Name) {
         throw Base::ValueError("Empty group name");
     }
@@ -409,6 +499,7 @@ Base::Reference<ParameterGrp> ParameterGrp::GetGroup(const char* Name)
 
 Base::Reference<ParameterGrp> ParameterGrp::_GetGroup(const char* Name)
 {
+    ParameterLock lock;
     Base::Reference<ParameterGrp> rParamGrp;
     if (!_pGroupNode) {
         if (FC_LOG_INSTANCE.isEnabled(FC_LOGLEVEL_LOG)) {
@@ -456,6 +547,7 @@ Base::Reference<ParameterGrp> ParameterGrp::_GetGroup(const char* Name)
 
 std::string ParameterGrp::GetPath() const
 {
+    ParameterLock lock;
     std::string path;
     if (_Parent && _Parent != _Manager) {
         path = _Parent->GetPath();
@@ -469,6 +561,7 @@ std::string ParameterGrp::GetPath() const
 
 std::vector<Base::Reference<ParameterGrp>> ParameterGrp::GetGroups()
 {
+    ParameterLock lock;
     Base::Reference<ParameterGrp> rParamGrp;
     std::vector<Base::Reference<ParameterGrp>> vrParamGrp;
 
@@ -500,12 +593,14 @@ std::vector<Base::Reference<ParameterGrp>> ParameterGrp::GetGroups()
 /// test if this group is empty
 bool ParameterGrp::IsEmpty() const
 {
+    ParameterLock lock;
     return !(_pGroupNode && _pGroupNode->getFirstChild());
 }
 
 /// test if a special sub group is in this group
 bool ParameterGrp::HasGroup(const char* Name) const
 {
+    ParameterLock lock;
     if (_GroupMap.find(Name) != _GroupMap.end()) {
         return true;
     }
@@ -539,6 +634,7 @@ const char* ParameterGrp::TypeName(ParamType Type)
 
 ParameterGrp::ParamType ParameterGrp::TypeValue(const char* Name)
 {
+    ParameterLock lock;
     if (Name) {
         if (boost::equals(Name, "FCBool")) {
             return ParamType::FCBool;
@@ -564,6 +660,7 @@ ParameterGrp::ParamType ParameterGrp::TypeValue(const char* Name)
 
 void ParameterGrp::SetAttribute(ParamType Type, const char* Name, const char* Value)
 {
+    ParameterLock lock;
     switch (Type) {
         case ParamType::FCBool:
         case ParamType::FCInt:
@@ -582,6 +679,7 @@ void ParameterGrp::SetAttribute(ParamType Type, const char* Name, const char* Va
 
 void ParameterGrp::RemoveAttribute(ParamType Type, const char* Name)
 {
+    ParameterLock lock;
     switch (Type) {
         case ParamType::FCBool:
             return RemoveBool(Name);
@@ -607,6 +705,7 @@ const char* ParameterGrp::GetAttribute(
     const char* Default
 ) const
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return Default;
     }
@@ -637,6 +736,7 @@ std::vector<std::pair<std::string, std::string>> ParameterGrp::GetAttributeMap(
     const char* sFilter
 ) const
 {
+    ParameterLock lock;
     std::vector<std::pair<std::string, std::string>> res;
     if (!_pGroupNode) {
         return res;
@@ -682,12 +782,19 @@ std::vector<std::pair<std::string, std::string>> ParameterGrp::GetAttributeMap(
 void ParameterGrp::_Notify(ParamType Type, const char* Name, const char* Value)
 {
     if (_Manager) {
-        _Manager->signalParamChanged(this, Type, Name, Value);
+        notifyWhenUnlocked([this,
+                            manager = _Manager,
+                            Type,
+                            name = optionalString(Name),
+                            value = optionalString(Value)]() {
+            manager->signalParamChanged(this, Type, cString(name), cString(value));
+        });
     }
 }
 
 void ParameterGrp::_SetAttribute(ParamType T, const char* Name, const char* Value)
 {
+    ParameterLock lock;
     const char* Type = TypeName(T);
     if (!Type) {
         return;
@@ -717,12 +824,13 @@ void ParameterGrp::_SetAttribute(ParamType T, const char* Name, const char* Valu
         }
         // For backward compatibility, old observer gets notified regardless of
         // value changes or not.
-        Notify(Name);
+        notifyObserversWhenUnlocked(this, Name);
     }
 }
 
 bool ParameterGrp::GetBool(const char* Name, bool bPreset) const
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return bPreset;
     }
@@ -740,11 +848,13 @@ bool ParameterGrp::GetBool(const char* Name, bool bPreset) const
 
 void ParameterGrp::SetBool(const char* Name, bool bValue)
 {
+    ParameterLock lock;
     _SetAttribute(ParamType::FCBool, Name, bValue ? "1" : "0");
 }
 
 std::vector<bool> ParameterGrp::GetBools(const char* sFilter) const
 {
+    ParameterLock lock;
     std::vector<bool> vrValues;
     if (!_pGroupNode) {
         return vrValues;
@@ -773,6 +883,7 @@ std::vector<bool> ParameterGrp::GetBools(const char* sFilter) const
 
 std::vector<std::pair<std::string, bool>> ParameterGrp::GetBoolMap(const char* sFilter) const
 {
+    ParameterLock lock;
     std::vector<std::pair<std::string, bool>> vrValues;
     if (!_pGroupNode) {
         return vrValues;
@@ -801,6 +912,7 @@ std::vector<std::pair<std::string, bool>> ParameterGrp::GetBoolMap(const char* s
 
 long ParameterGrp::GetInt(const char* Name, long lPreset) const
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return lPreset;
     }
@@ -817,12 +929,14 @@ long ParameterGrp::GetInt(const char* Name, long lPreset) const
 
 void ParameterGrp::SetInt(const char* Name, long lValue)
 {
+    ParameterLock lock;
     std::string buf = std::to_string(lValue);
     _SetAttribute(ParamType::FCInt, Name, buf.c_str());
 }
 
 std::vector<long> ParameterGrp::GetInts(const char* sFilter) const
 {
+    ParameterLock lock;
     std::vector<long> vrValues;
     if (!_pGroupNode) {
         return vrValues;
@@ -847,6 +961,7 @@ std::vector<long> ParameterGrp::GetInts(const char* sFilter) const
 
 std::vector<std::pair<std::string, long>> ParameterGrp::GetIntMap(const char* sFilter) const
 {
+    ParameterLock lock;
     std::vector<std::pair<std::string, long>> vrValues;
     if (!_pGroupNode) {
         return vrValues;
@@ -872,6 +987,7 @@ std::vector<std::pair<std::string, long>> ParameterGrp::GetIntMap(const char* sF
 
 unsigned long ParameterGrp::GetUnsigned(const char* Name, unsigned long lPreset) const
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return lPreset;
     }
@@ -890,12 +1006,14 @@ unsigned long ParameterGrp::GetUnsigned(const char* Name, unsigned long lPreset)
 
 void ParameterGrp::SetUnsigned(const char* Name, unsigned long lValue)
 {
+    ParameterLock lock;
     std::string buf = std::to_string(lValue);
     _SetAttribute(ParamType::FCUInt, Name, buf.c_str());
 }
 
 std::vector<unsigned long> ParameterGrp::GetUnsigneds(const char* sFilter) const
 {
+    ParameterLock lock;
     std::vector<unsigned long> vrValues;
     if (!_pGroupNode) {
         return vrValues;
@@ -923,6 +1041,7 @@ std::vector<unsigned long> ParameterGrp::GetUnsigneds(const char* sFilter) const
 
 std::vector<std::pair<std::string, unsigned long>> ParameterGrp::GetUnsignedMap(const char* sFilter) const
 {
+    ParameterLock lock;
     std::vector<std::pair<std::string, unsigned long>> vrValues;
     if (!_pGroupNode) {
         return vrValues;
@@ -953,6 +1072,7 @@ std::vector<std::pair<std::string, unsigned long>> ParameterGrp::GetUnsignedMap(
 
 double ParameterGrp::GetFloat(const char* Name, double dPreset) const
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return dPreset;
     }
@@ -969,6 +1089,7 @@ double ParameterGrp::GetFloat(const char* Name, double dPreset) const
 
 void ParameterGrp::SetFloat(const char* Name, double dValue)
 {
+    ParameterLock lock;
     // use 12 digits after the decimal point instead of the default 6
     // to handle values < 1.0e-6
     std::string buf = std::format("{:.12f}", dValue);
@@ -977,6 +1098,7 @@ void ParameterGrp::SetFloat(const char* Name, double dValue)
 
 std::vector<double> ParameterGrp::GetFloats(const char* sFilter) const
 {
+    ParameterLock lock;
     std::vector<double> vrValues;
     if (!_pGroupNode) {
         return vrValues;
@@ -1001,6 +1123,7 @@ std::vector<double> ParameterGrp::GetFloats(const char* sFilter) const
 
 std::vector<std::pair<std::string, double>> ParameterGrp::GetFloatMap(const char* sFilter) const
 {
+    ParameterLock lock;
     std::vector<std::pair<std::string, double>> vrValues;
     if (!_pGroupNode) {
         return vrValues;
@@ -1027,6 +1150,7 @@ std::vector<std::pair<std::string, double>> ParameterGrp::GetFloatMap(const char
 
 void ParameterGrp::SetASCII(const char* Name, const char* sValue)
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         if (FC_LOG_INSTANCE.isEnabled(FC_LOGLEVEL_LOG)) {
             FC_WARN("Setting attribute " << "FCText:" << Name << " in an orphan group " << _cName);
@@ -1062,12 +1186,13 @@ void ParameterGrp::SetASCII(const char* Name, const char* sValue)
             _Notify(ParamType::FCText, Name, sValue);
         }
         // trigger observer
-        Notify(Name);
+        notifyObserversWhenUnlocked(this, Name);
     }
 }
 
 std::string ParameterGrp::GetASCII(const char* Name, const char* pPreset) const
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return pPreset ? pPreset : "";
     }
@@ -1091,6 +1216,7 @@ std::string ParameterGrp::GetASCII(const char* Name, const char* pPreset) const
 
 std::vector<std::string> ParameterGrp::GetASCIIs(const char* sFilter) const
 {
+    ParameterLock lock;
     std::vector<std::string> vrValues;
     if (!_pGroupNode) {
         return vrValues;
@@ -1120,6 +1246,7 @@ std::vector<std::string> ParameterGrp::GetASCIIs(const char* sFilter) const
 
 std::vector<std::pair<std::string, std::string>> ParameterGrp::GetASCIIMap(const char* sFilter) const
 {
+    ParameterLock lock;
     std::vector<std::pair<std::string, std::string>> vrValues;
     if (!_pGroupNode) {
         return vrValues;
@@ -1155,6 +1282,7 @@ std::vector<std::pair<std::string, std::string>> ParameterGrp::GetASCIIMap(const
 
 void ParameterGrp::RemoveASCII(const char* Name)
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return;
     }
@@ -1171,11 +1299,12 @@ void ParameterGrp::RemoveASCII(const char* Name)
 
     // trigger observer
     _Notify(ParamType::FCText, Name, nullptr);
-    Notify(Name);
+    notifyObserversWhenUnlocked(this, Name);
 }
 
 void ParameterGrp::RemoveBool(const char* Name)
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return;
     }
@@ -1192,12 +1321,13 @@ void ParameterGrp::RemoveBool(const char* Name)
 
     // trigger observer
     _Notify(ParamType::FCBool, Name, nullptr);
-    Notify(Name);
+    notifyObserversWhenUnlocked(this, Name);
 }
 
 
 void ParameterGrp::RemoveFloat(const char* Name)
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return;
     }
@@ -1214,11 +1344,12 @@ void ParameterGrp::RemoveFloat(const char* Name)
 
     // trigger observer
     _Notify(ParamType::FCFloat, Name, nullptr);
-    Notify(Name);
+    notifyObserversWhenUnlocked(this, Name);
 }
 
 void ParameterGrp::RemoveInt(const char* Name)
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return;
     }
@@ -1235,11 +1366,12 @@ void ParameterGrp::RemoveInt(const char* Name)
 
     // trigger observer
     _Notify(ParamType::FCInt, Name, nullptr);
-    Notify(Name);
+    notifyObserversWhenUnlocked(this, Name);
 }
 
 void ParameterGrp::RemoveUnsigned(const char* Name)
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return;
     }
@@ -1256,11 +1388,12 @@ void ParameterGrp::RemoveUnsigned(const char* Name)
 
     // trigger observer
     _Notify(ParamType::FCUInt, Name, nullptr);
-    Notify(Name);
+    notifyObserversWhenUnlocked(this, Name);
 }
 
 Base::Color ParameterGrp::GetColor(const char* Name, Base::Color lPreset) const
 {
+    ParameterLock lock;
     auto packed = GetUnsigned(Name, lPreset.getPackedValue());
 
     return Color(static_cast<uint32_t>(packed));
@@ -1268,11 +1401,13 @@ Base::Color ParameterGrp::GetColor(const char* Name, Base::Color lPreset) const
 
 void ParameterGrp::SetColor(const char* Name, Base::Color lValue)
 {
+    ParameterLock lock;
     SetUnsigned(Name, lValue.getPackedValue());
 }
 
 std::vector<Base::Color> ParameterGrp::GetColors(const char* sFilter) const
 {
+    ParameterLock lock;
     auto packed = GetUnsigneds(sFilter);
     std::vector<Base::Color> result;
 
@@ -1288,6 +1423,7 @@ std::vector<Base::Color> ParameterGrp::GetColors(const char* sFilter) const
 
 std::vector<std::pair<std::string, Base::Color>> ParameterGrp::GetColorMap(const char* sFilter) const
 {
+    ParameterLock lock;
     auto packed = GetUnsignedMap(sFilter);
     std::vector<std::pair<std::string, Base::Color>> result;
 
@@ -1305,11 +1441,13 @@ std::vector<std::pair<std::string, Base::Color>> ParameterGrp::GetColorMap(const
 
 void ParameterGrp::RemoveColor(const char* Name)
 {
+    ParameterLock lock;
     RemoveUnsigned(Name);
 }
 
 void ParameterGrp::RemoveGrp(const char* Name)
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return;
     }
@@ -1336,11 +1474,12 @@ void ParameterGrp::RemoveGrp(const char* Name)
     }
 
     // trigger observer
-    Notify(Name);
+    notifyObserversWhenUnlocked(this, Name);
 }
 
 bool ParameterGrp::RenameGrp(const char* OldName, const char* NewName)
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return false;
     }
@@ -1371,6 +1510,7 @@ bool ParameterGrp::RenameGrp(const char* OldName, const char* NewName)
 
 void ParameterGrp::Clear(bool notify)
 {
+    ParameterLock lock;
     if (!_pGroupNode) {
         return;
     }
@@ -1423,12 +1563,12 @@ void ParameterGrp::Clear(bool notify)
     for (auto& v : params) {
         _Notify(v.first, v.second.c_str(), nullptr);
         if (notify) {
-            Notify(v.second.c_str());
+            notifyObserversWhenUnlocked(this, v.second.c_str());
         }
     }
 
     // trigger observer
-    Notify("");
+    notifyObserversWhenUnlocked(this, "");
 }
 
 //**************************************************************************
@@ -1436,6 +1576,7 @@ void ParameterGrp::Clear(bool notify)
 
 bool ParameterGrp::ShouldRemove() const
 {
+    ParameterLock lock;
     if (this->getRefCount() > 1) {
         return false;
     }
@@ -1447,6 +1588,7 @@ bool ParameterGrp::ShouldRemove() const
 
 DOMElement* ParameterGrp::FindElement(DOMElement* Start, const char* Type, const char* Name) const
 {
+    ParameterLock lock;
     if (XMLString::compareString(Start->getNodeName(), XStrLiteral("FCParamGroup").unicodeForm()) != 0
         && XMLString::compareString(Start->getNodeName(), XStrLiteral("FCParameters").unicodeForm())
             != 0) {
@@ -1486,6 +1628,7 @@ DOMElement* ParameterGrp::FindElement(DOMElement* Start, const char* Type, const
 
 DOMElement* ParameterGrp::FindNextElement(DOMNode* Prev, const char* Type) const
 {
+    ParameterLock lock;
     DOMNode* clChild = Prev;
     if (!clChild) {
         return nullptr;
@@ -1505,6 +1648,7 @@ DOMElement* ParameterGrp::FindNextElement(DOMNode* Prev, const char* Type) const
 
 DOMElement* ParameterGrp::FindOrCreateElement(DOMElement* Start, const char* Type, const char* Name)
 {
+    ParameterLock lock;
     // first try to find it
     DOMElement* pcElem = FindElement(Start, Type, Name);
     if (pcElem) {
@@ -1516,6 +1660,7 @@ DOMElement* ParameterGrp::FindOrCreateElement(DOMElement* Start, const char* Typ
 
 DOMNode* ParameterGrp::FindAttribute(DOMNode* Node, const char* Name) const
 {
+    ParameterLock lock;
     DOMNamedNodeMap* attr = Node->getAttributes();
     if (attr) {
         return attr->getNamedItem(XStr(Name).unicodeForm());
@@ -1527,6 +1672,7 @@ std::vector<std::pair<ParameterGrp::ParamType, std::string>> ParameterGrp::GetPa
     const char* sFilter
 ) const
 {
+    ParameterLock lock;
     std::vector<std::pair<ParameterGrp::ParamType, std::string>> res;
     if (!_pGroupNode) {
         return res;
@@ -1556,39 +1702,41 @@ std::vector<std::pair<ParameterGrp::ParamType, std::string>> ParameterGrp::GetPa
 
 void ParameterGrp::NotifyAll()
 {
+    ParameterLock lock;
     // get all ints and notify
     std::vector<std::pair<std::string, long>> IntMap = GetIntMap();
     for (const auto& it : IntMap) {
-        Notify(it.first.c_str());
+        notifyObserversWhenUnlocked(this, it.first.c_str());
     }
 
     // get all booleans and notify
     std::vector<std::pair<std::string, bool>> BoolMap = GetBoolMap();
     for (const auto& it : BoolMap) {
-        Notify(it.first.c_str());
+        notifyObserversWhenUnlocked(this, it.first.c_str());
     }
 
     // get all Floats and notify
     std::vector<std::pair<std::string, double>> FloatMap = GetFloatMap();
     for (const auto& it : FloatMap) {
-        Notify(it.first.c_str());
+        notifyObserversWhenUnlocked(this, it.first.c_str());
     }
 
     // get all strings and notify
     std::vector<std::pair<std::string, std::string>> StringMap = GetASCIIMap();
     for (const auto& it : StringMap) {
-        Notify(it.first.c_str());
+        notifyObserversWhenUnlocked(this, it.first.c_str());
     }
 
     // get all uints and notify
     std::vector<std::pair<std::string, unsigned long>> UIntMap = GetUnsignedMap();
     for (const auto& it : UIntMap) {
-        Notify(it.first.c_str());
+        notifyObserversWhenUnlocked(this, it.first.c_str());
     }
 }
 
 void ParameterGrp::_Reset()
 {
+    ParameterLock lock;
     _pGroupNode = nullptr;
     for (auto& v : _GroupMap) {
         v.second->_Reset();

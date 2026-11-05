@@ -57,6 +57,7 @@
 #include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepCheck_Analyzer.hxx>
+#include <mutex>
 #include <BRepCheck_ListOfStatus.hxx>
 #include <BRepClass_FaceClassifier.hxx>
 #include <BRepCheck_Result.hxx>
@@ -422,7 +423,9 @@ static std::array<std::string, TopAbs_SHAPE> _ShapeNames;
 
 static void initShapeNameMap()
 {
-    if (_ShapeNames[TopAbs_VERTEX].empty()) {
+    // Called from parallel recompute workers too: fill the table exactly once.
+    static std::once_flag once;
+    std::call_once(once, []() {
         _ShapeNames[TopAbs_VERTEX] = "Vertex";
         _ShapeNames[TopAbs_EDGE] = "Edge";
         _ShapeNames[TopAbs_FACE] = "Face";
@@ -431,7 +434,7 @@ static void initShapeNameMap()
         _ShapeNames[TopAbs_SOLID] = "Solid";
         _ShapeNames[TopAbs_COMPOUND] = "Compound";
         _ShapeNames[TopAbs_COMPSOLID] = "CompSolid";
-    }
+    });
 }
 
 std::pair<TopAbs_ShapeEnum, int> TopoShape::shapeTypeAndIndex(const char* name)

@@ -23,6 +23,8 @@
 
 #include "SignalException.h"
 #include <FCConfig.h>
+
+#include <mutex>
 #if defined(__GNUC__) && defined(FC_OS_LINUX)
 # include <array>
 # include <boost/stacktrace.hpp>
@@ -209,23 +211,38 @@ static void setSignal(OSD_SignalMode theSignalMode)
 
 #if defined(__GNUC__) && defined(FC_OS_LINUX)
 static OSD_SignalMode currentSignalMode = OSD_SignalMode_Unset;  // NOLINT
+// Live guards on all threads. Parallel recompute workers create guards concurrently: the
+// first one installs the handler and the last one restores the default, so a thread that
+// finishes early does not remove the handler while others still rely on it.
+static int signalGuards = 0;  // NOLINT
+
+static std::mutex& signalModeMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
 #endif
 
 SignalException::SignalException()
 {
 #if defined(__GNUC__) && defined(FC_OS_LINUX)
-    if (currentSignalMode == OSD_SignalMode_Unset) {
+    std::lock_guard<std::mutex> lock(signalModeMutex());
+    if (signalGuards++ == 0 && currentSignalMode == OSD_SignalMode_Unset) {
         currentSignalMode = OSD_SignalMode_Set;
         setSignal(currentSignalMode);
-        enabled = true;
     }
+    enabled = true;
 #endif
 }
 
 SignalException::~SignalException()
 {
 #if defined(__GNUC__) && defined(FC_OS_LINUX)
-    if (enabled && currentSignalMode == OSD_SignalMode_Set) {
+    if (!enabled) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(signalModeMutex());
+    if (--signalGuards == 0 && currentSignalMode == OSD_SignalMode_Set) {
         currentSignalMode = OSD_SignalMode_Unset;
         setSignal(currentSignalMode);
         // this is the default handler

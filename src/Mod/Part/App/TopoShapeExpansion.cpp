@@ -2112,8 +2112,8 @@ TopoShape TopoShape::getSubTopoShape(TopAbs_ShapeEnum type, int idx, bool silent
 
 static const std::string& _getElementMapVersion()
 {
-    static std::string _ver;
-    if (_ver.empty()) {
+    // Initialized once in a thread-safe way: shapes are built on parallel recompute workers.
+    static const std::string _ver = []() {
         std::ostringstream ss;
         // Stabilize the reported OCCT version: report 7.2.0 as the version so that we aren't
         // constantly inadvertently reporting differing versions. This is retained for
@@ -2121,8 +2121,8 @@ static const std::string& _getElementMapVersion()
         // removed here).
         unsigned occ_ver {0x070200};
         ss << OpCodes::Version << '.' << std::hex << occ_ver << '.';
-        _ver = ss.str();
-    }
+        return ss.str();
+    }();
     return _ver;
 }
 

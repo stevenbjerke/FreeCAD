@@ -25,6 +25,7 @@
 // NOLINTNEXTLINE
 
 #include <cstdlib>
+#include <mutex>
 #include <unordered_set>
 
 #include "IndexedName.h"
@@ -112,6 +113,9 @@ void IndexedName::set(const char* name,
     // If the type was NOT in the list of allowedNames, but the caller has set the allowOthers flag
     // to true, then add the new type to the static NameSet (if it is not already there).
     if (allowOthers) {
+        // Element names are built on parallel recompute workers too.
+        static std::mutex NameSetMutex;
+        std::lock_guard<std::mutex> lock(NameSetMutex);
         auto res = NameSet.insert(ByteArray(QByteArray::fromRawData(name, suffixPosition)));
         if (res.second /*The insert succeeded (the type was new)*/) {
             // Make sure that the data in the set is a unique (unshared) copy of the text

@@ -108,10 +108,12 @@ bool PropertyLinkBase::isSame(const Property& other) const
         return false;
     }
 
-    static std::vector<App::DocumentObject*> ret;
-    static std::vector<std::string> subs;
-    static std::vector<App::DocumentObject*> ret2;
-    static std::vector<std::string> subs2;
+    // Scratch buffers reused between calls; per thread, as links may be compared on
+    // parallel recompute workers.
+    thread_local std::vector<App::DocumentObject*> ret;
+    thread_local std::vector<std::string> subs;
+    thread_local std::vector<App::DocumentObject*> ret2;
+    thread_local std::vector<std::string> subs2;
 
     ret.clear();
     subs.clear();

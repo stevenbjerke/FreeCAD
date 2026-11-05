@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import sys
 import time
@@ -230,7 +231,25 @@ def _round(value, digits=6):
     return float(f"{value:.{digits}g}")
 
 
-def shape_fingerprint(shape):
+# Element names embed the owning object's ID as ";:H<hex>", optionally followed
+# by ":<hex length>" of a name that itself contains IDs. New documents start
+# numbering objects at a random offset, so the IDs (and hence those lengths)
+# vary between runs: replace IDs with object names and mask the length.
+TAG_PATTERN = re.compile(r";:H(-?[0-9a-f]+)(:[0-9a-f]+)?")
+
+
+def normalize_tags(name, tag_names):
+    # PartDesign tags the tool shape of an add/sub feature with the negated ID.
+    def replace(match):
+        tag = match.group(1)
+        sign, digits = ("-", tag[1:]) if tag.startswith("-") else ("", tag)
+        length = ":*" if match.group(2) else ""
+        return ";:H<" + sign + tag_names.get(digits, digits) + ">" + length
+
+    return TAG_PATTERN.sub(replace, name)
+
+
+def shape_fingerprint(shape, tag_names):
     fp = {"null": shape.isNull()}
     if shape.isNull():
         return fp
@@ -249,13 +268,16 @@ def shape_fingerprint(shape):
     )
     element_map = getattr(shape, "ElementMap", None)
     if element_map:
-        items = sorted((str(k), str(v)) for k, v in dict(element_map).items())
+        items = sorted(
+            (normalize_tags(str(k), tag_names), str(v)) for k, v in dict(element_map).items()
+        )
         fp["element_map_size"] = len(items)
         fp["element_map_sha256"] = hashlib.sha256(repr(items).encode()).hexdigest()
     return fp
 
 
 def document_fingerprint(doc):
+    tag_names = {format(obj.ID, "x"): obj.Name for obj in doc.Objects}
     objects = {}
     for obj in sorted(doc.Objects, key=lambda o: o.Name):
         entry = {"type": obj.TypeId, "valid": obj.isValid()}
@@ -266,7 +288,7 @@ def document_fingerprint(doc):
             entry["placement"] = [_round(v) for v in (*plc.Base, *plc.Rotation.Q)]
         shape = getattr(obj, "Shape", None)
         if shape is not None and hasattr(shape, "isNull"):
-            entry["shape"] = shape_fingerprint(shape)
+            entry["shape"] = shape_fingerprint(shape, tag_names)
         objects[obj.Name] = entry
     digest = hashlib.sha256(json.dumps(objects, sort_keys=True).encode()).hexdigest()
     return digest, objects
@@ -349,6 +371,10 @@ def main():
         doc_params.RemInt("RecomputeThreads")
 
     doc = App.newDocument("RecomputeBench")
+    # New documents start numbering objects at a random offset, and object IDs
+    # end up in element names (and, through name lengths, in which names get
+    # hashed). Reset the counter so every run numbers objects identically.
+    doc.clearDocument()
     t0 = time.perf_counter()
     description = BUILDERS[args.model](App, doc, args.size)
     build_s = time.perf_counter() - t0

@@ -66,10 +66,7 @@ def main():
     p.add_argument("--markdown")
     args = p.parse_args()
 
-    if not os.path.isdir(args.log_dir):
-        print(f"no log directory {args.log_dir}: no reports")
-        return 0
-    reports = parse(args.log_dir)
+    reports = parse(args.log_dir) if os.path.isdir(args.log_dir) else []
     groups = collections.OrderedDict()
     for report in reports:
         kind = re.search(r"WARNING: ThreadSanitizer: ([^(\n]+)", report).group(1).strip()

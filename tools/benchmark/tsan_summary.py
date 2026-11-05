@@ -57,6 +57,11 @@ def parse(directory):
         for chunk in text.split("==================")[1:]:
             if "WARNING: ThreadSanitizer:" in chunk:
                 reports.append(chunk.strip())
+        # Fatal runtime errors are not framed like reports; count them too.
+        for line in text.splitlines():
+            if "FATAL: ThreadSanitizer" in line or line.startswith("ThreadSanitizer: "):
+                reports.append("WARNING: ThreadSanitizer: fatal error\n" + text[:4000])
+                break
     return reports
 
 

@@ -267,17 +267,25 @@ jobs:
         run: |
           # Ubuntu's default ASLR entropy breaks the TSan runtime's memory layout.
           sudo sysctl vm.mmap_rnd_bits=28
-          runtime=$(pixi run clang++ -print-file-name=libclang_rt.tsan-x86_64.so)
+          runtime=$(pixi run clang++ -print-file-name=libclang_rt.tsan-x86_64.so | tail -n 1)
+          echo "TSan runtime: $runtime"; test -f "$runtime"
           mkdir -p "$GITHUB_WORKSPACE/tsan"
+          status=0
           export TSAN_OPTIONS="suppressions=$PWD/tools/benchmark/tsan.supp:halt_on_error=0:report_signal_unsafe=0:history_size=4:log_path=$GITHUB_WORKSPACE/tsan/tsan"
           for model in $MODELS; do
             echo "::group::$model"
             pixi run env LD_PRELOAD="$runtime" python tools/benchmark/recompute_bench.py \
               --freecad-lib build/tsan/lib --model "$model" --repeat 1 --threads 4 \
-              --out "$GITHUB_WORKSPACE/tsan/$model.json" \
-              || echo "::warning::$model exited with an error under TSan"
+              --out "$GITHUB_WORKSPACE/tsan/$model.json" > "$GITHUB_WORKSPACE/tsan/$model.out" 2>&1 \
+              || { echo "::error::$model exited with an error under TSan"; status=1; }
+            tail -n 40 "$GITHUB_WORKSPACE/tsan/$model.out"
             echo "::endgroup::"
           done
+          for f in "$GITHUB_WORKSPACE"/tsan/tsan.*; do
+            [ -f "$f" ] || continue
+            echo "::group::$(basename "$f") (first lines)"; head -n 60 "$f"; echo "::endgroup::"
+          done
+          exit $status
 
       - name: Summarize races
         if: always()

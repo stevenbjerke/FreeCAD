@@ -1165,6 +1165,12 @@ bool PropertyShapeCache::getShape(const App::DocumentObject* obj, TopoShape& sha
     // that has not been kept:
     //    if (PartParams::getDisableShapeCache())
     //        return false;
+
+    // The cache lives in a dynamic property of obj, which another parallel recompute
+    // worker may be reading or creating; skip it there and compute the shape instead.
+    if (App::Document::isParallelRecomputeWorker()) {
+        return false;
+    }
     auto prop = get(obj, false);
     if (!prop) {
         return false;
@@ -1192,6 +1198,11 @@ void PropertyShapeCache::setShape(const App::DocumentObject* obj, const TopoShap
     // that has not been kept:
     //    if (PartParams::getDisableShapeCache())
     //        return;
+
+    // Adding the cache property changes obj and notifies observers; not on a worker.
+    if (App::Document::isParallelRecomputeWorker()) {
+        return;
+    }
     auto prop = get(obj, true);
     if (!prop) {
         return;

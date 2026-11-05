@@ -1285,6 +1285,16 @@ public:
     /// Check if there is any document restoring/importing.
     static bool isAnyRestoring();
 
+    /**
+     * @brief Check if the calling thread recomputes an object in a parallel batch.
+     *
+     * Parallel recompute (see the RecomputeThreads parameter) runs independent objects on
+     * worker threads. Code reached from execute() that changes other objects or shared
+     * state (caches, registries, dynamic properties) must skip or defer that work when this
+     * returns true.
+     */
+    static bool isParallelRecomputeWorker();
+
     /// Register a new label.
     void registerLabel(std::string_view newLabel);
     /// Unregister a label.

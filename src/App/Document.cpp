@@ -3445,6 +3445,11 @@ int Document::_recomputeFeature(DocumentObject* Feat) // NOLINT
     return 0;
 }
 
+bool Document::isParallelRecomputeWorker()
+{
+    return onParallelRecomputeWorker;
+}
+
 bool Document::_recomputeInLevels(const std::vector<DocumentObject*>& order,
                                   std::set<DocumentObject*>& filter,
                                   int threads,

@@ -161,7 +161,7 @@ jobs:
               echo "::group::$model threads=$t"
               pixi run python "$GITHUB_WORKSPACE/bench/tools/benchmark/recompute_bench.py" \
                 --freecad-lib build/release/lib --model "$model" --repeat "$REPEAT" \
-                --label "$VARIANT" --out "$out" $extra || { echo "::error::$model threads=$t failed"; status=1; }
+                --label "$VARIANT" --out "$out" --mesh $extra || { echo "::error::$model threads=$t failed"; status=1; }
               echo "::endgroup::"
             done
           done

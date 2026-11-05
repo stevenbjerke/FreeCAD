@@ -122,6 +122,7 @@ def compare(baseline, candidate):
                 "cand_first_s": c["first_recompute_seconds"],
                 "speedup": b["median_seconds"] / c["median_seconds"] if c["median_seconds"] else float("nan"),
                 "base_mb": b["peak_rss_mb"],
+                "mesh_s": c.get("tessellation_seconds"),
                 "cand_mb": c["peak_rss_mb"],
                 "geometry_ok": not geometry,
                 "names_ok": not names,
@@ -150,14 +151,15 @@ def compare(baseline, candidate):
 def to_markdown(rows, problems):
     lines = [
         "| Model | Threads | Objects | Baseline (s) | Candidate (s) | Speedup | First recompute base / cand (s) "
-        "| Peak RSS base / cand (MB) | Geometry | Names |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| Peak RSS base / cand (MB) | Mesh once (s) | Geometry | Names |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         lines.append(
             f"| {r['name']} | {r['threads']} | {r['objects']} | {r['base_s']:.3f} | {r['cand_s']:.3f} | "
             f"{r['speedup']:.2f}x | {r['base_first_s']:.3f} / {r['cand_first_s']:.3f} | "
-            f"{r['base_mb']} / {r['cand_mb']} | {'same' if r['geometry_ok'] else '**DIFFERS**'} | "
+            f"{r['base_mb']} / {r['cand_mb']} | {r['mesh_s'] if r['mesh_s'] is not None else '-'} | "
+            f"{'same' if r['geometry_ok'] else '**DIFFERS**'} | "
             f"{'same' if r['names_ok'] else ('**DIFFER**' if r['serial_path'] else 'renumbered')} |"
         )
     lines.append("")

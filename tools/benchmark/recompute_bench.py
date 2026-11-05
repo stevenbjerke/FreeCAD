@@ -64,6 +64,11 @@ def parse_args():
     )
     p.add_argument("--label", default="", help="free-form label stored in the results")
     p.add_argument("--save-model", default=None, help="also save the generated .FCStd here")
+    p.add_argument(
+        "--mesh",
+        action="store_true",
+        help="also time tessellating every shape once, as the 3D view would after a recompute",
+    )
     return p.parse_args(argv)
 
 
@@ -302,6 +307,31 @@ def full_recompute(doc):
     return time.perf_counter() - start, count
 
 
+def time_tessellation(doc, deviation_percent=0.5):
+    """Tessellate a copy of every shape the way the 3D view does by default.
+
+    The view derives the linear deflection from the bounding box and the
+    Deviation setting (0.5 % by default). Copies are meshed so the document's
+    shapes are left untouched. Returns total seconds and triangle count.
+    """
+    total = 0.0
+    triangles = 0
+    for obj in doc.Objects:
+        shape = getattr(obj, "Shape", None)
+        if shape is None or not hasattr(shape, "isNull") or shape.isNull() or not shape.Faces:
+            continue
+        bb = shape.BoundBox
+        deflection = (bb.XLength + bb.YLength + bb.ZLength) / 300.0 * deviation_percent
+        if deflection <= 0:
+            continue
+        copy = shape.copy()
+        start = time.perf_counter()
+        _points, tris = copy.tessellate(deflection)
+        total += time.perf_counter() - start
+        triangles += len(tris)
+    return total, triangles
+
+
 def main():
     args = parse_args()
     App = import_freecad(args.freecad_lib)
@@ -328,6 +358,8 @@ def main():
         times.append(elapsed)
         counts.append(count)
 
+    mesh_s, mesh_triangles = time_tessellation(doc) if args.mesh else (None, None)
+
     digest, objects = document_fingerprint(doc)
     invalid = sorted(name for name, entry in objects.items() if not entry["valid"])
     ordered = sorted(times)
@@ -352,6 +384,8 @@ def main():
         "median_seconds": round(ordered[len(ordered) // 2], 4) if ordered else None,
         "min_seconds": round(ordered[0], 4) if ordered else None,
         "peak_rss_mb": peak_rss_mb(),
+        "tessellation_seconds": round(mesh_s, 4) if mesh_s is not None else None,
+        "tessellation_triangles": mesh_triangles,
         "invalid_objects": invalid,
         "fingerprint_sha256": digest,
         "fingerprint": objects,

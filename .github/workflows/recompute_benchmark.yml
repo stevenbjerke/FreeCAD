@@ -25,6 +25,8 @@ on:
       - parallel-recompute-research
     paths:
       - "src/App/**"
+      - "src/Base/**"
+      - "src/Mod/Material/**"
       - "src/Mod/Part/**"
       - "src/Mod/PartDesign/**"
       - "src/Mod/Assembly/**"

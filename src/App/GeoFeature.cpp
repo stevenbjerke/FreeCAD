@@ -32,6 +32,7 @@
 #include "GeoFeatureGroupExtension.h"
 #include "ElementNamingUtils.h"
 #include "Link.h"
+#include "MainThreadSignal.h"
 
 
 using namespace App;
@@ -278,7 +279,15 @@ void GeoFeature::onChanged(const Property* prop)
     if (prop == getPropertyOfGeometry()) {
         if (getDocument() && !getDocument()->testStatus(Document::Restoring)
             && !getDocument()->isPerformingTransaction()) {
-            updateElementReference();
+            if (auto* queue = MainThreadSignalConfig::deferredQueue()) {
+                // On a parallel recompute worker: updating element references
+                // rewrites links held by other objects and a global registry, so
+                // leave it to the scheduling thread, which runs it in order.
+                queue->emplace_back([this]() { updateElementReference(); });
+            }
+            else {
+                updateElementReference();
+            }
         }
     }
     DocumentObject::onChanged(prop);

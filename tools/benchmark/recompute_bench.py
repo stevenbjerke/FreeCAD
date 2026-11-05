@@ -38,6 +38,7 @@ import platform
 import shlex
 import sys
 import time
+import types
 
 MODELS = ("part_trees", "pd_pattern", "pd_bodies", "assembly")
 
@@ -75,8 +76,12 @@ def parse_args():
 def import_freecad(lib_dir):
     if lib_dir:
         sys.path.insert(0, os.path.abspath(lib_dir))
+    # FreeCAD's start-up script runs in the __main__ namespace and deletes the
+    # modules it finds there (time, json, ...), so put ours back afterwards.
+    saved = {k: v for k, v in globals().items() if isinstance(v, types.ModuleType)}
     import FreeCAD  # noqa: F401  (imported for side effects and returned)
 
+    globals().update(saved)
     return FreeCAD
 
 

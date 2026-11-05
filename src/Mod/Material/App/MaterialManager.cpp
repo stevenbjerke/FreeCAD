@@ -80,9 +80,10 @@ MaterialManager::~MaterialManager()
 
 MaterialManager& MaterialManager::getManager()
 {
-    if (!_manager) {
-        initManagers();
-    }
+    // Always check under the lock in initManagers(): this is called from parallel
+    // recompute workers too, and an unsynchronized check could hand out the manager
+    // before its construction is visible to the calling thread.
+    initManagers();
     return *_manager;
 }
 
